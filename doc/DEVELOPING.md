@@ -1264,6 +1264,16 @@ Environment overrides:
   stale-backup warning threshold
 - `PAPERCLIP_DB_BACKUP_ALERT_FILE=/path/to/failure-marker` lets external cron
   wrappers surface the last failed backup in `/api/health`
+- `PAPERCLIP_DB_BACKUP_TIMEOUT_MINUTES=<minutes>` bounds a single backup run.
+  The default is `60`. A backup that exceeds it fails with a timeout instead of
+  waiting forever, and its database connections are destroyed so an abandoned
+  backend cannot keep pinning the cluster's vacuum horizon.
+- `PAPERCLIP_DB_BACKUP_STALE_AFTER_MINUTES=<minutes>` is the backstop for the
+  in-flight guard: once a backup has held it this long it is treated as
+  abandoned and the next scheduled run takes over. The default is twice the
+  backup timeout. It exists because a guard released only in a `finally` is not
+  enough — a `finally` runs when a promise settles, and a deadlocked backup
+  never settles at all.
 - `PAPERCLIP_WORKSPACE_REAPER_COOLDOWN_DAYS=<days>` sets how long the
   terminal-workspace reaper waits after an issue tree becomes terminal before it
   archives the execution workspace and deletes the worktree. A person can reopen

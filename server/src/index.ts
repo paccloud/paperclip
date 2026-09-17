@@ -35,6 +35,8 @@ import {
   reconcilePendingMigrationHistory,
   formatDatabaseBackupResult,
   runDatabaseBackup,
+  pruneDatabaseBackups,
+  DEFAULT_BACKUP_TIMEOUT_SECONDS,
   authUsers,
   companies,
   companyMemberships,
@@ -43,6 +45,7 @@ import {
 import detectPort from "detect-port";
 import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
+import { createDatabaseBackupInFlightGuard } from "./database-backup-in-flight-guard.js";
 import { logger } from "./middleware/logger.js";
 import { setStartupRecoveryPhase } from "./startup-recovery-state.js";
 import {
@@ -811,20 +814,65 @@ async function startServerWithDatabaseTeardown(
     resolve(config.databaseBackupDir, "db-backup-to-s3.failure"),
     resolve(config.databaseBackupDir, "..", "db-backup-to-s3.failure"),
   ];
-  let databaseBackupInFlight = false;
+  const databaseBackupTimeoutSeconds = Math.max(
+    60,
+    Number(process.env.PAPERCLIP_DB_BACKUP_TIMEOUT_MINUTES) * 60 || DEFAULT_BACKUP_TIMEOUT_SECONDS,
+  );
+  // Backstop for a hang the backup's own deadline cannot reach. Generous on
+  // purpose: taking a lease over is only ever correct when the holder is
+  // beyond any doubt abandoned.
+  const databaseBackupStaleAfterMs = Math.max(
+    60_000,
+    Number(process.env.PAPERCLIP_DB_BACKUP_STALE_AFTER_MINUTES) * 60_000 ||
+      databaseBackupTimeoutSeconds * 2 * 1000,
+  );
+  const databaseBackupGuard = createDatabaseBackupInFlightGuard({
+    staleAfterMs: databaseBackupStaleAfterMs,
+  });
+  const pruneDatabaseBackupsOnSkip = async (): Promise<void> => {
+    try {
+      const { backupRetention } = await backupSettingsSvc.getGeneral();
+      const prunedCount = pruneDatabaseBackups({
+        backupDir: config.databaseBackupDir,
+        retention: backupRetention,
+        filenamePrefix: "paperclip",
+        orphanGraceSeconds: databaseBackupTimeoutSeconds,
+      });
+      if (prunedCount > 0) {
+        logger.info(
+          { prunedCount, backupDir: config.databaseBackupDir },
+          `Pruned ${prunedCount} old backup(s) while a previous backup was still running`,
+        );
+      }
+    } catch (err) {
+      logger.warn({ err, backupDir: config.databaseBackupDir }, "Backup retention pruning failed");
+    }
+  };
   const runServerDatabaseBackup = async (
     trigger: InstanceDatabaseBackupTrigger,
   ): Promise<InstanceDatabaseBackupRunResult | null> => {
-    if (databaseBackupInFlight) {
+    const lease = databaseBackupGuard.acquire();
+    if (!lease.ok) {
       const message = "Database backup already in progress";
       if (trigger === "scheduled") {
-        logger.warn("Skipping scheduled database backup because a previous backup is still running");
+        logger.warn(
+          { heldForMs: lease.heldForMs, staleAfterMs: databaseBackupStaleAfterMs },
+          "Skipping scheduled database backup because a previous backup is still running",
+        );
+        // Retention must not be hostage to the backup finishing: a stuck backup
+        // stops pruning too, and the disk it is filling is often what stuck it.
+        await pruneDatabaseBackupsOnSkip();
         return null;
       }
       throw conflict(message);
     }
+    if (lease.tookOverAfterMs !== null) {
+      logger.error(
+        { abandonedAfterMs: lease.tookOverAfterMs, staleAfterMs: databaseBackupStaleAfterMs },
+        "Previous database backup never finished; treating it as abandoned and starting a new one",
+      );
+    }
 
-    databaseBackupInFlight = true;
     const startedAt = new Date();
     const startedAtMs = Date.now();
     const label = trigger === "scheduled" ? "Automatic" : "Manual";
@@ -839,6 +887,7 @@ async function startServerWithDatabaseTeardown(
         backupDir: config.databaseBackupDir,
         retention,
         filenamePrefix: "paperclip",
+        timeoutSeconds: databaseBackupTimeoutSeconds,
       });
       const finishedAt = new Date();
       const response: InstanceDatabaseBackupRunResult = {
@@ -867,7 +916,7 @@ async function startServerWithDatabaseTeardown(
       logger.error({ err, backupDir: config.databaseBackupDir, trigger }, `${label} database backup failed`);
       throw err;
     } finally {
-      databaseBackupInFlight = false;
+      lease.release();
     }
   };
   const pluginWorkerManager = createPluginWorkerManager();

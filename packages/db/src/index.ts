@@ -23,7 +23,11 @@ export {
 export {
   runDatabaseBackup,
   runDatabaseRestore,
+  pruneDatabaseBackups,
   formatDatabaseBackupResult,
+  DatabaseBackupTimeoutError,
+  DEFAULT_BACKUP_TIMEOUT_SECONDS,
+  DEFAULT_BACKUP_CLOSE_TIMEOUT_SECONDS,
   type BackupRetentionPolicy,
   type RunDatabaseBackupOptions,
   type RunDatabaseBackupResult,
