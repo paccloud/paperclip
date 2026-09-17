@@ -1,10 +1,17 @@
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { gunzipSync } from "node:zlib";
 import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
-import { createBufferedTextFileWriter, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
+import {
+  DatabaseBackupTimeoutError,
+  createBufferedTextFileWriter,
+  pruneDatabaseBackups,
+  runDatabaseBackup,
+  runDatabaseRestore,
+} from "./backup-lib.js";
 import { ensurePostgresDatabase } from "./client.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -71,6 +78,159 @@ describe("createBufferedTextFileWriter", () => {
     await writer.close();
 
     expect(fs.readFileSync(outputPath, "utf8")).toBe(lines.join("\n"));
+  });
+});
+
+describe("runDatabaseBackup deadline", () => {
+  /**
+   * Accepts the connection and then answers nothing, ever. This is the shape
+   * that broke production: not a backup that *died* — a killed backup already
+   * recovers — but one that never settles, so every `finally` waiting on it,
+   * including the caller's in-flight guard, waits forever too.
+   */
+  async function startBlackHolePostgres(): Promise<string> {
+    const sockets: net.Socket[] = [];
+    const server = net.createServer((socket) => {
+      sockets.push(socket);
+      // Read the startup packet and reply with nothing.
+      socket.resume();
+    });
+    await new Promise<void>((resolveListening, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolveListening);
+    });
+    cleanups.push(async () => {
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    });
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("black-hole postgres did not bind a TCP port");
+    }
+    return `postgres://paperclip:paperclip@127.0.0.1:${address.port}/paperclip`;
+  }
+
+  it("rejects the caller when the backup never settles", async () => {
+    const connectionString = await startBlackHolePostgres();
+    const backupDir = createTempDir("paperclip-db-backup-deadline-");
+    const startedAtMs = Date.now();
+
+    // connect_timeout is deliberately far past the deadline: the point is that
+    // the *overall* deadline is what releases the caller, not a bound that only
+    // covers connection setup.
+    const backup = runDatabaseBackup({
+      connectionString,
+      backupDir,
+      retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 2 },
+      filenamePrefix: "paperclip-deadline",
+      connectTimeoutSeconds: 120,
+      timeoutSeconds: 1,
+    });
+
+    await expect(backup).rejects.toThrow(DatabaseBackupTimeoutError);
+    await expect(backup).rejects.toMatchObject({ timeoutMs: 1_000 });
+    expect(Date.now() - startedAtMs).toBeLessThan(30_000);
+  }, 60_000);
+
+  it("applies retention even though the backup never completes", async () => {
+    const connectionString = await startBlackHolePostgres();
+    const backupDir = createTempDir("paperclip-db-backup-deadline-retention-");
+    const ancient = path.join(backupDir, "paperclip-deadline-ancient.sql.gz");
+    const corpse = path.join(backupDir, "paperclip-deadline-20260911-015107.sql");
+
+    fs.writeFileSync(ancient, "an archive well past retention");
+    fs.writeFileSync(corpse, "a partial dump from a run that never unwound");
+    const longAgo = new Date(Date.now() - 400 * 24 * 60 * 60 * 1000);
+    fs.utimesSync(ancient, longAgo, longAgo);
+    fs.utimesSync(corpse, longAgo, longAgo);
+
+    await expect(
+      runDatabaseBackup({
+        connectionString,
+        backupDir,
+        retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 2 },
+        filenamePrefix: "paperclip-deadline",
+        connectTimeoutSeconds: 120,
+        timeoutSeconds: 1,
+      }),
+    ).rejects.toThrow(DatabaseBackupTimeoutError);
+
+    // Retention that only runs after a successful backup stops running exactly
+    // when a stuck backup makes it matter: here the disk keeps filling while
+    // nothing is ever pruned again.
+    expect(fs.existsSync(ancient)).toBe(false);
+    expect(fs.existsSync(corpse)).toBe(false);
+  }, 60_000);
+
+  it("leaves no compressed backup behind when the deadline fires", async () => {
+    const connectionString = await startBlackHolePostgres();
+    const backupDir = createTempDir("paperclip-db-backup-deadline-artifacts-");
+
+    await expect(
+      runDatabaseBackup({
+        connectionString,
+        backupDir,
+        retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 2 },
+        filenamePrefix: "paperclip-deadline",
+        connectTimeoutSeconds: 120,
+        timeoutSeconds: 1,
+      }),
+    ).rejects.toThrow(DatabaseBackupTimeoutError);
+
+    expect(fs.readdirSync(backupDir).filter((name) => name.endsWith(".sql.gz"))).toEqual([]);
+  }, 60_000);
+});
+
+describe("pruneDatabaseBackups", () => {
+  it("deletes raw .sql files a wedged run left behind, and spares recent ones", () => {
+    const backupDir = createTempDir("paperclip-db-backup-orphans-");
+    const corpse = path.join(backupDir, "paperclip-20260911-015107.sql");
+    const inProgress = path.join(backupDir, "paperclip-20260917-020000.sql");
+    const keptArchive = path.join(backupDir, "paperclip-20260917-010000.sql.gz");
+
+    fs.writeFileSync(corpse, "partial dump from a backup that never unwound");
+    fs.writeFileSync(inProgress, "a backup running right now, in another process");
+    fs.writeFileSync(keptArchive, "a real backup");
+
+    const sixDaysAgo = new Date(Date.now() - 6 * 24 * 60 * 60 * 1000);
+    fs.utimesSync(corpse, sixDaysAgo, sixDaysAgo);
+
+    const prunedCount = pruneDatabaseBackups({
+      backupDir,
+      retention: { dailyDays: 30, weeklyWeeks: 4, monthlyMonths: 12 },
+      filenamePrefix: "paperclip",
+      orphanGraceSeconds: 60 * 60,
+    });
+
+    expect(prunedCount).toBe(1);
+    expect(fs.existsSync(corpse)).toBe(false);
+    // Younger than the grace period: it may well be an active backup.
+    expect(fs.existsSync(inProgress)).toBe(true);
+    expect(fs.existsSync(keptArchive)).toBe(true);
+  });
+
+  it("applies retention without a backup having to succeed first", () => {
+    const backupDir = createTempDir("paperclip-db-backup-standalone-prune-");
+    const recent = path.join(backupDir, "paperclip-recent.sql.gz");
+    const ancient = path.join(backupDir, "paperclip-ancient.sql.gz");
+    const foreign = path.join(backupDir, "other-prefix-ancient.sql.gz");
+
+    for (const file of [recent, ancient, foreign]) fs.writeFileSync(file, "backup");
+    const longAgo = new Date(Date.now() - 400 * 24 * 60 * 60 * 1000);
+    fs.utimesSync(ancient, longAgo, longAgo);
+    fs.utimesSync(foreign, longAgo, longAgo);
+
+    const prunedCount = pruneDatabaseBackups({
+      backupDir,
+      retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 2 },
+      filenamePrefix: "paperclip",
+    });
+
+    expect(prunedCount).toBe(1);
+    expect(fs.existsSync(recent)).toBe(true);
+    expect(fs.existsSync(ancient)).toBe(false);
+    // A different prefix belongs to a different instance sharing the directory.
+    expect(fs.existsSync(foreign)).toBe(true);
   });
 });
 
