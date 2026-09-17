@@ -45,7 +45,10 @@ import {
 import detectPort from "detect-port";
 import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
-import { createDatabaseBackupInFlightGuard } from "./database-backup-in-flight-guard.js";
+import {
+  createDatabaseBackupInFlightGuard,
+  resolveDatabaseBackupTimings,
+} from "./database-backup-in-flight-guard.js";
 import { logger } from "./middleware/logger.js";
 import { setStartupRecoveryPhase } from "./startup-recovery-state.js";
 import {
@@ -814,18 +817,20 @@ async function startServerWithDatabaseTeardown(
     resolve(config.databaseBackupDir, "db-backup-to-s3.failure"),
     resolve(config.databaseBackupDir, "..", "db-backup-to-s3.failure"),
   ];
-  const databaseBackupTimeoutSeconds = Math.max(
-    60,
-    Number(process.env.PAPERCLIP_DB_BACKUP_TIMEOUT_MINUTES) * 60 || DEFAULT_BACKUP_TIMEOUT_SECONDS,
-  );
-  // Backstop for a hang the backup's own deadline cannot reach. Generous on
-  // purpose: taking a lease over is only ever correct when the holder is
-  // beyond any doubt abandoned.
-  const databaseBackupStaleAfterMs = Math.max(
-    60_000,
-    Number(process.env.PAPERCLIP_DB_BACKUP_STALE_AFTER_MINUTES) * 60_000 ||
-      databaseBackupTimeoutSeconds * 2 * 1000,
-  );
+  // The deadline and the guard's staleness threshold are resolved together,
+  // because a threshold below the deadline would let the next scheduled run
+  // take the lease over while the first backup is still inside its own valid
+  // deadline. See `resolveDatabaseBackupTimings`.
+  const { timeoutSeconds: databaseBackupTimeoutSeconds, staleAfterMs: databaseBackupStaleAfterMs } =
+    resolveDatabaseBackupTimings({
+      defaultTimeoutSeconds: DEFAULT_BACKUP_TIMEOUT_SECONDS,
+      onInvalid: (name, value) => {
+        logger.warn(
+          { setting: name, value },
+          `Ignoring ${name}: expected a positive, finite number of minutes`,
+        );
+      },
+    });
   const databaseBackupGuard = createDatabaseBackupInFlightGuard({
     staleAfterMs: databaseBackupStaleAfterMs,
   });
