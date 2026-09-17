@@ -17,6 +17,29 @@
  * on.
  */
 
+/**
+ * The largest delay Node's timer accepts: it takes a 32-bit signed integer of
+ * milliseconds (~24.8 days). A larger delay — or a non-finite one — is clamped
+ * to **1ms** with a `TimeoutOverflowWarning`, so an operator asking for a very
+ * generous deadline would instead get one that fires almost immediately and
+ * fails every backup. That is strictly worse than the unbounded behaviour this
+ * module replaces, so the value is normalized before it reaches the timer.
+ */
+export const MAX_BACKUP_DEADLINE_MS = 2_147_483_647;
+
+/**
+ * Clamps a deadline into the range the timer actually supports.
+ *
+ * A non-finite deadline resolves to the maximum rather than the minimum on
+ * purpose. The two failure directions are not symmetric: a deadline that is too
+ * long degrades the bound, while one that is too short breaks every backup on
+ * the instance. When the configured value cannot be honoured, degrade.
+ */
+export function normalizeBackupDeadlineMs(timeoutMs: number): number {
+  if (!Number.isFinite(timeoutMs)) return MAX_BACKUP_DEADLINE_MS;
+  return Math.min(MAX_BACKUP_DEADLINE_MS, Math.max(1, Math.trunc(timeoutMs)));
+}
+
 export class DatabaseBackupTimeoutError extends Error {
   readonly timeoutMs: number;
   readonly phase: string;
@@ -51,6 +74,7 @@ export function createBackupDeadline(
   timeoutMs: number,
   options: { onTimeout?: (error: DatabaseBackupTimeoutError) => void } = {},
 ): BackupDeadline {
+  const effectiveTimeoutMs = normalizeBackupDeadlineMs(timeoutMs);
   const teardowns = new Set<() => void>();
   const phases: string[] = [];
   let expiredError: DatabaseBackupTimeoutError | null = null;
@@ -64,7 +88,10 @@ export function createBackupDeadline(
   expiry.catch(() => {});
 
   const timer = setTimeout(() => {
-    expiredError = new DatabaseBackupTimeoutError(phases[phases.length - 1] ?? "starting up", timeoutMs);
+    expiredError = new DatabaseBackupTimeoutError(
+      phases[phases.length - 1] ?? "starting up",
+      effectiveTimeoutMs,
+    );
     for (const teardown of [...teardowns]) {
       try {
         teardown();
@@ -75,12 +102,12 @@ export function createBackupDeadline(
     teardowns.clear();
     options.onTimeout?.(expiredError);
     rejectExpiry?.(expiredError);
-  }, timeoutMs);
+  }, effectiveTimeoutMs);
   // Never hold the process open just to enforce a deadline.
   timer.unref?.();
 
   return {
-    timeoutMs,
+    timeoutMs: effectiveTimeoutMs,
     expired: () => expiredError !== null,
     onExpire(teardown) {
       if (expiredError !== null) {

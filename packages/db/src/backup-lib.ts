@@ -7,7 +7,12 @@ import { pipeline } from "node:stream/promises";
 import { createGunzip, createGzip } from "node:zlib";
 import postgres from "postgres";
 import { type BackupDeadline, createBackupDeadline } from "./backup-deadline.js";
-export { DatabaseBackupTimeoutError, type BackupDeadline } from "./backup-deadline.js";
+export {
+  DatabaseBackupTimeoutError,
+  MAX_BACKUP_DEADLINE_MS,
+  normalizeBackupDeadlineMs,
+  type BackupDeadline,
+} from "./backup-deadline.js";
 
 export type BackupRetentionPolicy = {
   dailyDays: number;

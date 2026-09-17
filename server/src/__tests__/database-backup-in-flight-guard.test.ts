@@ -1,5 +1,16 @@
 import { describe, expect, it } from "vitest";
-import { createDatabaseBackupInFlightGuard } from "../database-backup-in-flight-guard.js";
+import {
+  MAX_BACKUP_TIMEOUT_SECONDS,
+  MIN_BACKUP_TIMEOUT_SECONDS,
+  createDatabaseBackupInFlightGuard,
+  resolveDatabaseBackupTimings,
+} from "../database-backup-in-flight-guard.js";
+
+const DEFAULT_TIMEOUT_SECONDS = 60 * 60;
+
+function resolve(env: NodeJS.ProcessEnv) {
+  return resolveDatabaseBackupTimings({ env, defaultTimeoutSeconds: DEFAULT_TIMEOUT_SECONDS });
+}
 
 /**
  * The regression these cover is specifically *not* "a backup died without
@@ -97,5 +108,108 @@ describe("createDatabaseBackupInFlightGuard", () => {
     expect(next.ok).toBe(true);
     // The double release above must not have freed *this* lease as well.
     expect(guard.heldSince()).toBe(0);
+  });
+});
+
+describe("resolveDatabaseBackupTimings", () => {
+  it("defaults to the backup timeout with twice that as the staleness backstop", () => {
+    expect(resolve({})).toEqual({
+      timeoutSeconds: DEFAULT_TIMEOUT_SECONDS,
+      staleAfterMs: DEFAULT_TIMEOUT_SECONDS * 2 * 1000,
+    });
+  });
+
+  it("honours an in-range timeout override", () => {
+    expect(resolve({ PAPERCLIP_DB_BACKUP_TIMEOUT_MINUTES: "90" })).toEqual({
+      timeoutSeconds: 90 * 60,
+      staleAfterMs: 90 * 60 * 2 * 1000,
+    });
+  });
+
+  /**
+   * The single-flight guarantee is the whole point of the guard. A staleness
+   * threshold under the deadline lets the next scheduled run take the lease
+   * over while the first backup is still inside its own valid deadline — two
+   * database- and disk-intensive backups at once.
+   */
+  it("never lets the staleness threshold fall below the backup deadline", () => {
+    const { timeoutSeconds, staleAfterMs } = resolve({
+      PAPERCLIP_DB_BACKUP_TIMEOUT_MINUTES: "120",
+      PAPERCLIP_DB_BACKUP_STALE_AFTER_MINUTES: "60",
+    });
+    expect(timeoutSeconds).toBe(120 * 60);
+    expect(staleAfterMs).toBeGreaterThan(timeoutSeconds * 1000);
+    expect(staleAfterMs).toBe(120 * 60 * 2 * 1000);
+  });
+
+  it("lets an operator raise the staleness threshold above the floor", () => {
+    expect(
+      resolve({
+        PAPERCLIP_DB_BACKUP_TIMEOUT_MINUTES: "60",
+        PAPERCLIP_DB_BACKUP_STALE_AFTER_MINUTES: "600",
+      }),
+    ).toEqual({ timeoutSeconds: 60 * 60, staleAfterMs: 600 * 60_000 });
+  });
+
+  it("keeps the one-minute floor when the deadline is at its shortest", () => {
+    // 60s deadline -> 120s floor, which already clears the 60_000ms minimum.
+    const { timeoutSeconds, staleAfterMs } = resolve({ PAPERCLIP_DB_BACKUP_TIMEOUT_MINUTES: "0.5" });
+    expect(timeoutSeconds).toBe(MIN_BACKUP_TIMEOUT_SECONDS);
+    expect(staleAfterMs).toBe(120_000);
+  });
+
+  /**
+   * Node clamps a timer delay above 2^31-1 ms, or a non-finite one, to 1ms.
+   * Left unchecked, asking for a very generous deadline would fail every
+   * backup almost instantly.
+   */
+  it("caps a timeout that Node's timer could not honour", () => {
+    // ~76 years.
+    const { timeoutSeconds } = resolve({ PAPERCLIP_DB_BACKUP_TIMEOUT_MINUTES: "40000000" });
+    expect(timeoutSeconds).toBe(MAX_BACKUP_TIMEOUT_SECONDS);
+    expect(timeoutSeconds * 1000).toBeLessThanOrEqual(2_147_483_647);
+  });
+
+  it("falls back to the default for a non-finite or non-positive override", () => {
+    const rejected: string[] = [];
+    for (const value of ["Infinity", "-Infinity", "NaN", "not-a-number", "0", "-5", "   "]) {
+      const timings = resolveDatabaseBackupTimings({
+        env: { PAPERCLIP_DB_BACKUP_TIMEOUT_MINUTES: value },
+        defaultTimeoutSeconds: DEFAULT_TIMEOUT_SECONDS,
+        onInvalid: (name) => rejected.push(name),
+      });
+      expect(timings.timeoutSeconds).toBe(DEFAULT_TIMEOUT_SECONDS);
+    }
+    // The blank value is a plain "unset", not an operator error worth warning
+    // about; the other six are reported.
+    expect(rejected).toHaveLength(6);
+  });
+
+  it("ignores a non-finite staleness override rather than propagating it", () => {
+    const { staleAfterMs } = resolve({
+      PAPERCLIP_DB_BACKUP_TIMEOUT_MINUTES: "60",
+      PAPERCLIP_DB_BACKUP_STALE_AFTER_MINUTES: "Infinity",
+    });
+    expect(Number.isFinite(staleAfterMs)).toBe(true);
+    expect(staleAfterMs).toBe(60 * 60 * 2 * 1000);
+  });
+
+  it("produces a guard that actually refuses a takeover inside the deadline", () => {
+    const { timeoutSeconds, staleAfterMs } = resolve({
+      PAPERCLIP_DB_BACKUP_TIMEOUT_MINUTES: "120",
+      PAPERCLIP_DB_BACKUP_STALE_AFTER_MINUTES: "60",
+    });
+    let nowMs = 1_000;
+    const guard = createDatabaseBackupInFlightGuard({ staleAfterMs, now: () => nowMs });
+    expect(guard.acquire().ok).toBe(true);
+
+    // One hour in: the old threshold would have handed the lease away here,
+    // while the first backup still has an hour of its deadline left.
+    nowMs += 60 * 60 * 1000;
+    expect(guard.acquire().ok).toBe(false);
+
+    // Still held at the deadline itself.
+    nowMs += timeoutSeconds * 1000 - 60 * 60 * 1000;
+    expect(guard.acquire().ok).toBe(false);
   });
 });

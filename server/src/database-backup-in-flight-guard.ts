@@ -14,6 +14,108 @@
  * releases nothing, because by then it no longer holds the lease.
  */
 
+/**
+ * Largest deadline Node's timer can honour, in seconds. Above this the timer
+ * clamps the delay to 1ms, which would fail every backup instantly instead of
+ * granting the generous deadline that was asked for.
+ *
+ * `normalizeBackupDeadlineMs` in `@paperclipai/db` is the authoritative clamp —
+ * it is what actually guards the timer, for every caller. This copy of the
+ * bound keeps an out-of-range setting from reaching the deadline in the first
+ * place, so the operator's configured value and the deadline in force agree.
+ * Declared locally rather than imported so this module stays free of a
+ * cross-package dependency (`@paperclipai/db` is module-mocked by other server
+ * tests, which would leave the constant undefined here).
+ */
+export const MAX_BACKUP_TIMEOUT_SECONDS = Math.floor(2_147_483_647 / 1000);
+
+/** Shortest deadline an operator may configure. */
+export const MIN_BACKUP_TIMEOUT_SECONDS = 60;
+
+/** Shortest staleness threshold, regardless of how short the deadline is. */
+export const MIN_BACKUP_STALE_AFTER_MS = 60_000;
+
+/**
+ * How many times the backup deadline the staleness threshold must be, at
+ * minimum. Taking a lease over is only ever correct when the holder is beyond
+ * any doubt abandoned, and a holder inside its own deadline is not.
+ */
+const STALE_AFTER_DEADLINE_MULTIPLE = 2;
+
+function readPositiveMinutes(
+  env: NodeJS.ProcessEnv,
+  name: string,
+  onInvalid?: (name: string, value: string) => void,
+): number | null {
+  const raw = env[name];
+  if (raw === undefined || raw.trim() === "") return null;
+  const minutes = Number(raw);
+  // Rejects NaN, ±Infinity and non-positive values alike. An override that
+  // cannot be honoured is dropped in favour of the default rather than being
+  // propagated into a timer or a comparison.
+  if (!Number.isFinite(minutes) || minutes <= 0) {
+    onInvalid?.(name, raw);
+    return null;
+  }
+  return minutes;
+}
+
+export type DatabaseBackupTimings = {
+  /** Deadline for one backup run, already inside the timer's supported range. */
+  readonly timeoutSeconds: number;
+  /** Guard staleness threshold. Always greater than the deadline. */
+  readonly staleAfterMs: number;
+};
+
+/**
+ * Resolves the backup deadline and the guard's staleness threshold *together*,
+ * because the two are not independent.
+ *
+ * A threshold below the deadline breaks the single-flight guarantee: with a
+ * two-hour deadline and a one-hour threshold, the next scheduled run takes the
+ * lease over after an hour while the first backup is still inside its own valid
+ * deadline — two database- and disk-intensive backups at once, which is the
+ * exact overlap this guard exists to prevent. So the threshold has a floor of
+ * twice the deadline that an operator may raise but not lower.
+ *
+ * Both overrides are parsed defensively; see {@link readPositiveMinutes}.
+ */
+export function resolveDatabaseBackupTimings(options: {
+  defaultTimeoutSeconds: number;
+  env?: NodeJS.ProcessEnv;
+  onInvalid?: (name: string, value: string) => void;
+}): DatabaseBackupTimings {
+  const env = options.env ?? process.env;
+  const { onInvalid } = options;
+
+  const configuredTimeoutMinutes = readPositiveMinutes(
+    env,
+    "PAPERCLIP_DB_BACKUP_TIMEOUT_MINUTES",
+    onInvalid,
+  );
+  const requestedTimeoutSeconds =
+    configuredTimeoutMinutes !== null
+      ? Math.round(configuredTimeoutMinutes * 60)
+      : options.defaultTimeoutSeconds;
+  const timeoutSeconds = Math.min(
+    MAX_BACKUP_TIMEOUT_SECONDS,
+    Math.max(MIN_BACKUP_TIMEOUT_SECONDS, requestedTimeoutSeconds),
+  );
+
+  const configuredStaleAfterMinutes = readPositiveMinutes(
+    env,
+    "PAPERCLIP_DB_BACKUP_STALE_AFTER_MINUTES",
+    onInvalid,
+  );
+  const staleAfterMs = Math.max(
+    MIN_BACKUP_STALE_AFTER_MS,
+    timeoutSeconds * STALE_AFTER_DEADLINE_MULTIPLE * 1000,
+    configuredStaleAfterMinutes !== null ? Math.round(configuredStaleAfterMinutes * 60_000) : 0,
+  );
+
+  return { timeoutSeconds, staleAfterMs };
+}
+
 export type DatabaseBackupLease = {
   readonly ok: true;
   /**
