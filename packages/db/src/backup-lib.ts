@@ -144,13 +144,27 @@ function openBackupConnection(
     max: 1,
     connect_timeout: options.connectTimeoutSeconds,
     connection: {
+      // Only parameters a transaction-mode pooler tracks may go in the startup
+      // packet. pgbouncer and Supavisor reject the *whole connection* when it
+      // names one they do not (`unsupported startup parameter`), and the pooled
+      // URL is exactly what a backup gets: `resolveConnectionString` prefers
+      // `DATABASE_URL`, which these deployments point at the pooler. Everything
+      // else is applied after connect, below.
       application_name: "paperclip-backup",
-      // Server-side backstop so an abandoned statement cannot hold a snapshot —
-      // and with it the cluster-wide vacuum horizon — indefinitely.
-      statement_timeout: statementTimeoutMs,
-      idle_in_transaction_session_timeout: statementTimeoutMs,
     },
   });
+  // Server-side backstop so an abandoned statement cannot hold a snapshot — and
+  // with it the cluster-wide vacuum horizon — indefinitely. `max: 1` makes this
+  // the first statement on the only connection in the pool, so it is in force
+  // before any backup query runs. Session-scoped (`false`) rather than
+  // transaction-local: the COPY it guards runs outside an explicit transaction.
+  // A failure here is not fatal — `deadline` is the primary bound and still
+  // fires — so the rejection is swallowed rather than left unhandled.
+  void sql`
+    select
+      set_config('statement_timeout', ${String(statementTimeoutMs)}, false),
+      set_config('idle_in_transaction_session_timeout', ${String(statementTimeoutMs)}, false)
+  `.catch(() => {});
   // `end({ timeout: 0 })` destroys the socket instead of waiting for the query,
   // which is what actually unblocks a backend parked in `ClientWrite`.
   const unregister = deadline.onExpire(() => {

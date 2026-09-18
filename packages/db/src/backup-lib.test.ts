@@ -110,6 +110,74 @@ describe("runDatabaseBackup deadline", () => {
     return `postgres://paperclip:paperclip@127.0.0.1:${address.port}/paperclip`;
   }
 
+  /**
+   * Same black hole, but it keeps what the client said first. The startup
+   * packet is the only thing a transaction-mode pooler inspects before it
+   * decides whether to accept the connection at all, so asserting on these
+   * bytes is what actually proves the backup can reach a pooled database.
+   */
+  async function startStartupPacketRecorder(): Promise<{
+    connectionString: string;
+    startupPacket: Promise<string>;
+  }> {
+    const sockets: net.Socket[] = [];
+    let resolvePacket: (packet: string) => void = () => {};
+    const startupPacket = new Promise<string>((resolve) => {
+      resolvePacket = resolve;
+    });
+    const server = net.createServer((socket) => {
+      sockets.push(socket);
+      socket.once("data", (chunk: Buffer) => {
+        resolvePacket(chunk.toString("latin1"));
+      });
+    });
+    await new Promise<void>((resolveListening, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolveListening);
+    });
+    cleanups.push(async () => {
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    });
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("startup-packet recorder did not bind a TCP port");
+    }
+    return {
+      connectionString: `postgres://paperclip:paperclip@127.0.0.1:${address.port}/paperclip`,
+      startupPacket,
+    };
+  }
+
+  it("keeps pooler-incompatible parameters out of the startup packet", async () => {
+    const { connectionString, startupPacket } = await startStartupPacketRecorder();
+    const backupDir = createTempDir("paperclip-db-backup-startup-packet-");
+
+    await expect(
+      runDatabaseBackup({
+        connectionString,
+        backupDir,
+        retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 2 },
+        filenamePrefix: "paperclip-startup",
+        connectTimeoutSeconds: 120,
+        timeoutSeconds: 2,
+        statementTimeoutSeconds: 30,
+      }),
+    ).rejects.toThrow(DatabaseBackupTimeoutError);
+
+    const packet = await startupPacket;
+
+    // pgbouncer and Supavisor track only a small set of startup parameters and
+    // refuse the connection outright on any other — so naming the timeouts here
+    // does not merely go unapplied, it stops the backup from connecting at all
+    // on every deployment that points `DATABASE_URL` at a transaction pooler.
+    // They belong in a `set_config` after connect instead.
+    expect(packet).toContain("application_name");
+    expect(packet).toContain("paperclip-backup");
+    expect(packet).not.toContain("statement_timeout");
+    expect(packet).not.toContain("idle_in_transaction_session_timeout");
+  }, 60_000);
+
   it("rejects the caller when the backup never settles", async () => {
     const connectionString = await startBlackHolePostgres();
     const backupDir = createTempDir("paperclip-db-backup-deadline-");
