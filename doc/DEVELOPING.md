@@ -1282,7 +1282,9 @@ Environment overrides:
   is also the default. A threshold below the backup deadline would let the next
   scheduled run take the lease over while the first backup is still inside its
   own valid deadline, running two database- and disk-intensive backups at once —
-  the overlap the guard exists to prevent.
+  the overlap the guard exists to prevent. A value below the floor is raised to
+  it and logged at `warn`, naming both the requested and the effective value, so
+  the substitution is visible instead of silent.
 - `PAPERCLIP_WORKSPACE_REAPER_COOLDOWN_DAYS=<days>` sets how long the
   terminal-workspace reaper waits after an issue tree becomes terminal before it
   archives the execution workspace and deletes the worktree. A person can reopen

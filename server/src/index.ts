@@ -830,6 +830,15 @@ async function startServerWithDatabaseTeardown(
           `Ignoring ${name}: expected a positive, finite number of minutes`,
         );
       },
+      onRaisedToFloor: (name, requestedMinutes, effectiveMinutes) => {
+        logger.warn(
+          { setting: name, requestedMinutes, effectiveMinutes },
+          `Raising ${name} from ${requestedMinutes} to ${effectiveMinutes} minutes: ` +
+            `the staleness threshold must stay at least twice the backup deadline, ` +
+            `or a scheduled run could take the guard over while the backup holding ` +
+            `it is still inside its own deadline`,
+        );
+      },
     });
   const databaseBackupGuard = createDatabaseBackupInFlightGuard({
     staleAfterMs: databaseBackupStaleAfterMs,

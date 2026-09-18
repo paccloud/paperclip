@@ -84,9 +84,20 @@ export function resolveDatabaseBackupTimings(options: {
   defaultTimeoutSeconds: number;
   env?: NodeJS.ProcessEnv;
   onInvalid?: (name: string, value: string) => void;
+  /**
+   * Called when a *valid* staleness override was below the floor and has been
+   * raised to it. Distinct from {@link onInvalid}: the operator's value parsed
+   * fine, it just cannot be honoured, and silently substituting a different one
+   * is how a deliberate setting goes unnoticed.
+   */
+  onRaisedToFloor?: (
+    name: string,
+    requestedMinutes: number,
+    effectiveMinutes: number,
+  ) => void;
 }): DatabaseBackupTimings {
   const env = options.env ?? process.env;
-  const { onInvalid } = options;
+  const { onInvalid, onRaisedToFloor } = options;
 
   const configuredTimeoutMinutes = readPositiveMinutes(
     env,
@@ -107,11 +118,23 @@ export function resolveDatabaseBackupTimings(options: {
     "PAPERCLIP_DB_BACKUP_STALE_AFTER_MINUTES",
     onInvalid,
   );
-  const staleAfterMs = Math.max(
+  const floorMs = Math.max(
     MIN_BACKUP_STALE_AFTER_MS,
     timeoutSeconds * STALE_AFTER_DEADLINE_MULTIPLE * 1000,
-    configuredStaleAfterMinutes !== null ? Math.round(configuredStaleAfterMinutes * 60_000) : 0,
   );
+  const requestedStaleAfterMs =
+    configuredStaleAfterMinutes !== null ? Math.round(configuredStaleAfterMinutes * 60_000) : 0;
+  const staleAfterMs = Math.max(floorMs, requestedStaleAfterMs);
+
+  // Only when an override was actually supplied *and* actually raised. An
+  // override equal to the floor changed nothing and is not worth a warning.
+  if (configuredStaleAfterMinutes !== null && requestedStaleAfterMs < floorMs) {
+    onRaisedToFloor?.(
+      "PAPERCLIP_DB_BACKUP_STALE_AFTER_MINUTES",
+      configuredStaleAfterMinutes,
+      staleAfterMs / 60_000,
+    );
+  }
 
   return { timeoutSeconds, staleAfterMs };
 }

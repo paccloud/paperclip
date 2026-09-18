@@ -142,6 +142,68 @@ describe("resolveDatabaseBackupTimings", () => {
     expect(staleAfterMs).toBe(120 * 60 * 2 * 1000);
   });
 
+  /**
+   * Clamping to the floor is correct, but doing it silently is how a
+   * deliberate operator setting disappears: they ask for 60 minutes, get 240,
+   * and nothing anywhere says so.
+   */
+  it("reports a staleness override that was raised to the floor", () => {
+    const raised: Array<[string, number, number]> = [];
+    const { staleAfterMs } = resolveDatabaseBackupTimings({
+      env: {
+        PAPERCLIP_DB_BACKUP_TIMEOUT_MINUTES: "120",
+        PAPERCLIP_DB_BACKUP_STALE_AFTER_MINUTES: "60",
+      },
+      defaultTimeoutSeconds: DEFAULT_TIMEOUT_SECONDS,
+      onRaisedToFloor: (name, requested, effective) => raised.push([name, requested, effective]),
+    });
+    expect(staleAfterMs).toBe(120 * 60 * 2 * 1000);
+    // The effective value is reported in the same unit the operator set.
+    expect(raised).toEqual([["PAPERCLIP_DB_BACKUP_STALE_AFTER_MINUTES", 60, 240]]);
+  });
+
+  it("stays quiet when the staleness override is honoured, unset, or exactly the floor", () => {
+    const raised: string[] = [];
+    const cases: NodeJS.ProcessEnv[] = [
+      // Honoured: above the floor.
+      { PAPERCLIP_DB_BACKUP_TIMEOUT_MINUTES: "60", PAPERCLIP_DB_BACKUP_STALE_AFTER_MINUTES: "600" },
+      // Unset: the default is not an operator value being overridden.
+      { PAPERCLIP_DB_BACKUP_TIMEOUT_MINUTES: "60" },
+      // Exactly the floor: nothing was raised, so there is nothing to report.
+      { PAPERCLIP_DB_BACKUP_TIMEOUT_MINUTES: "60", PAPERCLIP_DB_BACKUP_STALE_AFTER_MINUTES: "120" },
+    ];
+    for (const env of cases) {
+      resolveDatabaseBackupTimings({
+        env,
+        defaultTimeoutSeconds: DEFAULT_TIMEOUT_SECONDS,
+        onRaisedToFloor: (name) => raised.push(name),
+      });
+    }
+    expect(raised).toEqual([]);
+  });
+
+  /**
+   * An unusable override parses to `null`, which makes the *requested* value
+   * 0ms — below the floor like any under-floor setting. It must still be
+   * reported as invalid and not as "raised", or one operator mistake produces
+   * two contradictory warnings.
+   */
+  it("reports an unusable staleness override as invalid, never as raised", () => {
+    const invalid: string[] = [];
+    const raised: string[] = [];
+    resolveDatabaseBackupTimings({
+      env: {
+        PAPERCLIP_DB_BACKUP_TIMEOUT_MINUTES: "60",
+        PAPERCLIP_DB_BACKUP_STALE_AFTER_MINUTES: "Infinity",
+      },
+      defaultTimeoutSeconds: DEFAULT_TIMEOUT_SECONDS,
+      onInvalid: (name) => invalid.push(name),
+      onRaisedToFloor: (name) => raised.push(name),
+    });
+    expect(invalid).toEqual(["PAPERCLIP_DB_BACKUP_STALE_AFTER_MINUTES"]);
+    expect(raised).toEqual([]);
+  });
+
   it("lets an operator raise the staleness threshold above the floor", () => {
     expect(
       resolve({
