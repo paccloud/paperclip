@@ -128,8 +128,37 @@ function sanitizeRestoreErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/**
+ * Applies the backup's server-side timeouts to `tx` **transaction-locally**.
+ *
+ * The third `set_config` argument is `true` (`SET LOCAL`) on purpose, and this
+ * must only ever be called on a handle that is already inside an explicit
+ * transaction. That is what makes the setting survive a transaction-mode
+ * pooler: pgbouncer and Supavisor hand a client a server backend for the
+ * duration of a transaction and no longer, so a session-scoped setting issued
+ * as its own statement lands on a backend the protected statement may never
+ * see. It is also the idiom the rest of this repo already uses — every
+ * `set_config` under `server/src/services/` passes `true` from inside a
+ * `db.transaction(...)`.
+ */
+export async function applyLocalBackupTimeouts(
+  tx: Pick<postgres.Sql, "unsafe">,
+  statementTimeoutMs: number,
+): Promise<void> {
+  await tx.unsafe(
+    "select set_config('statement_timeout', $1, true), set_config('idle_in_transaction_session_timeout', $1, true)",
+    [String(Math.max(1000, Math.trunc(statementTimeoutMs)))],
+  );
+}
+
 type BackupConnection = {
   sql: postgres.Sql;
+  /**
+   * Runs `fn` inside an explicit transaction that has the backup timeouts
+   * applied locally, so the bound is in force on the very backend that runs
+   * the guarded statement even through a transaction-mode pooler.
+   */
+  withLocalTimeouts<T>(fn: (tx: postgres.Sql) => Promise<T>): Promise<T>;
   /** Bounded close. Never rejects, never outlives `closeTimeoutSeconds`. */
   close(): Promise<void>;
 };
@@ -153,13 +182,19 @@ function openBackupConnection(
       application_name: "paperclip-backup",
     },
   });
-  // Server-side backstop so an abandoned statement cannot hold a snapshot — and
-  // with it the cluster-wide vacuum horizon — indefinitely. `max: 1` makes this
-  // the first statement on the only connection in the pool, so it is in force
-  // before any backup query runs. Session-scoped (`false`) rather than
-  // transaction-local: the COPY it guards runs outside an explicit transaction.
-  // A failure here is not fatal — `deadline` is the primary bound and still
-  // fires — so the rejection is swallowed rather than left unhandled.
+  // Server-side backstop for the short metadata queries, so an abandoned
+  // statement cannot hold a snapshot — and with it the cluster-wide vacuum
+  // horizon — indefinitely. `max: 1` makes this the first statement on the only
+  // connection in the pool, so it is in force before any backup query runs.
+  //
+  // This one is session-scoped, and that is only reliable on a direct or
+  // session-pooled connection: a transaction-mode pooler releases the backend
+  // when this statement's implicit transaction ends, so a later statement may
+  // run somewhere that never saw it. It is therefore best-effort, and the long
+  // guarded operations do not depend on it — they apply their own bound inside
+  // their own transaction via `withLocalTimeouts`. A failure here is not fatal
+  // (`deadline` is the primary bound and still fires), so the rejection is
+  // swallowed rather than left unhandled.
   void sql`
     select
       set_config('statement_timeout', ${String(statementTimeoutMs)}, false),
@@ -174,6 +209,12 @@ function openBackupConnection(
   let closed = false;
   return {
     sql,
+    async withLocalTimeouts<T>(fn: (tx: postgres.Sql) => Promise<T>): Promise<T> {
+      return (await sql.begin(async (tx) => {
+        await applyLocalBackupTimeouts(tx, statementTimeoutMs);
+        return await fn(tx as unknown as postgres.Sql);
+      })) as T;
+    },
     async close() {
       if (closed) return;
       closed = true;
@@ -1163,8 +1204,14 @@ async function runBoundedDatabaseBackup(
         const copyConnection = openBackupConnection(opts.connectionString, connectionOptions, deadline);
         try {
           await deadline.guard(
-            (async () => {
-              const copyStream = await copyConnection.sql
+            // The COPY is the statement that can pin the vacuum horizon, so its
+            // timeout is applied in the *same transaction* that runs it. A
+            // transaction-mode pooler keeps one backend for a whole
+            // transaction, which is what makes the bound reach the backend
+            // doing the copying; a session-scoped `set_config` issued as its
+            // own statement would not survive the hop.
+            copyConnection.withLocalTimeouts(async (tx) => {
+              const copyStream = await tx
                 .unsafe(`COPY ${qualifiedTableName} (${colNames}) TO STDOUT`)
                 .readable();
               try {
@@ -1177,7 +1224,7 @@ async function runBoundedDatabaseBackup(
                 // notice and give up.
                 copyStream.destroy();
               }
-            })(),
+            }),
             `copying ${schema_name}.${tablename}`,
           );
         } finally {

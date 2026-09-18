@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
 import {
   DatabaseBackupTimeoutError,
+  applyLocalBackupTimeouts,
   createBufferedTextFileWriter,
   pruneDatabaseBackups,
   runDatabaseBackup,
@@ -827,6 +828,112 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
       } finally {
         await restoreSql.end();
       }
+    },
+    20_000,
+  );
+});
+
+describeEmbeddedPostgres("runDatabaseBackup streaming COPY path", () => {
+  it(
+    "streams COPY data from inside the timeout-bounded transaction",
+    async () => {
+      const sourceConnectionString = await createTempDatabase();
+      const backupDir = createTempDir("paperclip-db-copy-txn-backup-");
+      const sourceSql = postgres(sourceConnectionString, { max: 1, onnotice: () => {} });
+
+      try {
+        await sourceSql.unsafe(`
+          CREATE TABLE "public"."copy_txn_rows" (
+            "id" integer PRIMARY KEY,
+            "payload" text NOT NULL
+          );
+          CREATE TABLE "public"."copy_txn_skipped" ("id" integer PRIMARY KEY);
+          INSERT INTO "public"."copy_txn_rows" ("id", "payload")
+          SELECT g, 'row-' || g FROM generate_series(1, 500) AS g;
+        `);
+
+        // `excludeTables` is a transform, so pg_dump is not eligible while the
+        // engine still resolves to `auto` — the only combination that reaches
+        // the streaming COPY branch, and therefore the only one that exercises
+        // the transaction the COPY's `statement_timeout` is scoped to.
+        const result = await runDatabaseBackup({
+          connectionString: sourceConnectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-copy-txn",
+          backupEngine: "auto",
+          excludeTables: ["copy_txn_skipped"],
+          statementTimeoutSeconds: 30,
+        });
+
+        const backupSql = gunzipSync(await fs.promises.readFile(result.backupFile)).toString("utf8");
+        // Guards the test itself: without this the assertions below would still
+        // pass on the row-cursor path and prove nothing about COPY.
+        // Guards the test itself: without this the assertions below would still
+        // pass on the row-cursor path and prove nothing about COPY.
+        expect(backupSql).toContain(`COPY "public"."copy_txn_rows" ("id", "payload") FROM stdin;`);
+
+        // Every row has to survive the round trip through the transaction, not
+        // just the first chunk — a COPY that the transaction cut short would
+        // still emit the header and a truncated body.
+        const copyBody = backupSql
+          .split(`COPY "public"."copy_txn_rows" ("id", "payload") FROM stdin;\n`)[1]
+          ?.split("\n\\.")[0] ?? "";
+        const copiedRows = copyBody.split("\n").filter((line) => line.length > 0);
+        expect(copiedRows).toHaveLength(500);
+        expect(copiedRows[0]).toBe("1\trow-1");
+        expect(copiedRows.at(-1)).toBe("500\trow-500");
+      } finally {
+        await sourceSql.end();
+      }
+    },
+    60_000,
+  );
+});
+
+describeEmbeddedPostgres("applyLocalBackupTimeouts", () => {
+  it(
+    "binds the backup timeouts to the transaction, not to the session",
+    async () => {
+      const connectionString = await createTempDatabase();
+      const sql = postgres(connectionString, { max: 1 });
+      cleanups.push(async () => {
+        await sql.end({ timeout: 5 });
+      });
+
+      // `pg_settings.setting` reports the raw value in the GUC's own base unit
+      // (ms), so this does not depend on how PostgreSQL chooses to spell the
+      // interval back at us the way `current_setting` would.
+      const readTimeouts = async (handle: postgres.Sql) =>
+        await handle<{ name: string; setting: string }[]>`
+          SELECT name, setting
+          FROM pg_settings
+          WHERE name IN ('statement_timeout', 'idle_in_transaction_session_timeout')
+          ORDER BY name
+        `;
+
+      const before = await readTimeouts(sql);
+
+      const inside = await sql.begin(async (tx) => {
+        await applyLocalBackupTimeouts(tx, 7_000);
+        return await readTimeouts(tx as unknown as postgres.Sql);
+      });
+
+      // In force on the backend that runs the guarded statement — this is the
+      // half that a standalone, session-scoped `set_config` cannot guarantee
+      // through a transaction-mode pooler, because the pooler is free to run
+      // the protected statement on a different backend.
+      expect(inside).toEqual([
+        { name: "idle_in_transaction_session_timeout", setting: "7000" },
+        { name: "statement_timeout", setting: "7000" },
+      ]);
+
+      // ...and gone again the moment the transaction ends. A pooler hands that
+      // backend to the next client, so a setting that outlived the transaction
+      // would be a cross-tenant leak rather than a backstop.
+      const after = await readTimeouts(sql);
+      expect(after).toEqual(before);
+      expect(after.map((row) => row.setting)).not.toContain("7000");
     },
     20_000,
   );
