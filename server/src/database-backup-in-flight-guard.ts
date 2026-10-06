@@ -42,6 +42,26 @@ export const MIN_BACKUP_STALE_AFTER_MS = 60_000;
  */
 const STALE_AFTER_DEADLINE_MULTIPLE = 2;
 
+/**
+ * Largest staleness threshold an operator may configure.
+ *
+ * Unlike the deadline this never reaches a timer, so the bound is not Node's —
+ * it exists because the threshold is only ever *compared* against elapsed
+ * milliseconds, and the comparison has no upper guard of its own. A threshold
+ * large enough to never be reached turns the guard back into the unreleasable
+ * boolean this module replaced: `heldForMs < staleAfterMs` stays true, the
+ * abandoned lease is never displaced, and every later scheduled backup is
+ * refused until the process restarts.
+ *
+ * The specific value is the largest threshold that could ever be *required* —
+ * twice the longest configurable deadline, i.e. the largest floor
+ * {@link resolveDatabaseBackupTimings} can compute. Capping here can therefore
+ * never collide with that floor, and anything beyond it is asking for a lease
+ * that outlives the deadline justifying it by orders of magnitude.
+ */
+export const MAX_BACKUP_STALE_AFTER_MS =
+  MAX_BACKUP_TIMEOUT_SECONDS * STALE_AFTER_DEADLINE_MULTIPLE * 1000;
+
 function readPositiveMinutes(
   env: NodeJS.ProcessEnv,
   name: string,
@@ -95,9 +115,19 @@ export function resolveDatabaseBackupTimings(options: {
     requestedMinutes: number,
     effectiveMinutes: number,
   ) => void;
+  /**
+   * Called when a *valid* staleness override exceeded the cap and has been
+   * lowered to it. See {@link MAX_BACKUP_STALE_AFTER_MS}; reported for the same
+   * reason as {@link onRaisedToFloor}.
+   */
+  onLoweredToCap?: (
+    name: string,
+    requestedMinutes: number,
+    effectiveMinutes: number,
+  ) => void;
 }): DatabaseBackupTimings {
   const env = options.env ?? process.env;
-  const { onInvalid, onRaisedToFloor } = options;
+  const { onInvalid, onRaisedToFloor, onLoweredToCap } = options;
 
   const configuredTimeoutMinutes = readPositiveMinutes(
     env,
@@ -122,14 +152,31 @@ export function resolveDatabaseBackupTimings(options: {
     MIN_BACKUP_STALE_AFTER_MS,
     timeoutSeconds * STALE_AFTER_DEADLINE_MULTIPLE * 1000,
   );
-  const requestedStaleAfterMs =
+  // `readPositiveMinutes` established finiteness in *minutes*; the value that
+  // reaches the comparison is milliseconds, and the conversion can overflow a
+  // large-but-finite override straight back to `Infinity`. So the cap is
+  // applied after the multiplication, not before it — `Math.min` folds an
+  // overflowed `Infinity` down to the cap for free.
+  const uncappedStaleAfterMs =
     configuredStaleAfterMinutes !== null ? Math.round(configuredStaleAfterMinutes * 60_000) : 0;
+  const requestedStaleAfterMs = Math.min(MAX_BACKUP_STALE_AFTER_MS, uncappedStaleAfterMs);
   const staleAfterMs = Math.max(floorMs, requestedStaleAfterMs);
 
   // Only when an override was actually supplied *and* actually raised. An
   // override equal to the floor changed nothing and is not worth a warning.
   if (configuredStaleAfterMinutes !== null && requestedStaleAfterMs < floorMs) {
     onRaisedToFloor?.(
+      "PAPERCLIP_DB_BACKUP_STALE_AFTER_MINUTES",
+      configuredStaleAfterMinutes,
+      staleAfterMs / 60_000,
+    );
+  }
+
+  // The mirror of the floor warning, and reported for the same reason: the
+  // operator's value parsed fine and was still not the one in force. The two
+  // are mutually exclusive, because the cap is never below the floor.
+  if (configuredStaleAfterMinutes !== null && uncappedStaleAfterMs > MAX_BACKUP_STALE_AFTER_MS) {
+    onLoweredToCap?.(
       "PAPERCLIP_DB_BACKUP_STALE_AFTER_MINUTES",
       configuredStaleAfterMinutes,
       staleAfterMs / 60_000,
@@ -168,7 +215,15 @@ export function createDatabaseBackupInFlightGuard(options: {
   now?: () => number;
 }): DatabaseBackupGuard {
   const now = options.now ?? Date.now;
-  const staleAfterMs = Math.max(1, Math.trunc(options.staleAfterMs));
+  // Clamped here as well as in `resolveDatabaseBackupTimings`, because this is
+  // exported and the threshold is the one value that can disable the guard
+  // outright. `Infinity` would refuse every takeover forever; `NaN` would make
+  // `heldForMs < staleAfterMs` false and hand the lease away instantly, running
+  // two backups at once. Both resolve to the cap: of the two failure directions,
+  // reclaiming too late is recoverable and overlapping is not.
+  const staleAfterMs = Number.isFinite(options.staleAfterMs)
+    ? Math.min(MAX_BACKUP_STALE_AFTER_MS, Math.max(1, Math.trunc(options.staleAfterMs)))
+    : MAX_BACKUP_STALE_AFTER_MS;
   let holder: { token: symbol; acquiredAtMs: number } | null = null;
 
   return {

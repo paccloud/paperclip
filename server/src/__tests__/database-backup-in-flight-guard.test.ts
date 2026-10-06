@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  MAX_BACKUP_STALE_AFTER_MS,
   MAX_BACKUP_TIMEOUT_SECONDS,
   MIN_BACKUP_TIMEOUT_SECONDS,
   createDatabaseBackupInFlightGuard,
@@ -273,5 +274,121 @@ describe("resolveDatabaseBackupTimings", () => {
     // Still held at the deadline itself.
     nowMs += timeoutSeconds * 1000 - 60 * 60 * 1000;
     expect(guard.acquire().ok).toBe(false);
+  });
+
+  /**
+   * The finiteness check in `readPositiveMinutes` runs on *minutes*, but the
+   * value that reaches the comparison is milliseconds. A large-but-finite
+   * override therefore cleared validation and then overflowed on the `* 60_000`,
+   * so the threshold in force was `Infinity`: `heldForMs < staleAfterMs` stayed
+   * true for every elapsed time, the abandoned lease was never displaced, and
+   * every later scheduled backup was refused until the process restarted. That
+   * is precisely the wedge this module exists to end, reached through the config
+   * path rather than through a stuck COPY.
+   */
+  it("caps a staleness override that overflows to Infinity in milliseconds", () => {
+    const { staleAfterMs } = resolve({
+      PAPERCLIP_DB_BACKUP_TIMEOUT_MINUTES: "60",
+      PAPERCLIP_DB_BACKUP_STALE_AFTER_MINUTES: "1e308",
+    });
+    expect(Number.isFinite(staleAfterMs)).toBe(true);
+    expect(staleAfterMs).toBe(MAX_BACKUP_STALE_AFTER_MS);
+  });
+
+  it("still reclaims an abandoned lease under an overflowing override", () => {
+    const { staleAfterMs } = resolve({
+      PAPERCLIP_DB_BACKUP_TIMEOUT_MINUTES: "60",
+      PAPERCLIP_DB_BACKUP_STALE_AFTER_MINUTES: "1e308",
+    });
+    let nowMs = 1_000;
+    const guard = createDatabaseBackupInFlightGuard({ staleAfterMs, now: () => nowMs });
+    expect(guard.acquire().ok).toBe(true);
+    void neverSettles();
+
+    nowMs += staleAfterMs + 1;
+    expect(guard.acquire().ok).toBe(true);
+  });
+
+  /**
+   * A large finite override that does *not* overflow is capped on the same
+   * grounds: a threshold measured in millennia is a disabled guard, not a
+   * generous one.
+   */
+  it("caps a large finite staleness override that never overflows", () => {
+    const { staleAfterMs } = resolve({
+      PAPERCLIP_DB_BACKUP_TIMEOUT_MINUTES: "60",
+      PAPERCLIP_DB_BACKUP_STALE_AFTER_MINUTES: "1e12",
+    });
+    expect(staleAfterMs).toBe(MAX_BACKUP_STALE_AFTER_MS);
+  });
+
+  it("reports a staleness override that was lowered to the cap, never as raised", () => {
+    const lowered: Array<[string, number, number]> = [];
+    const raised: string[] = [];
+    resolveDatabaseBackupTimings({
+      env: {
+        PAPERCLIP_DB_BACKUP_TIMEOUT_MINUTES: "60",
+        PAPERCLIP_DB_BACKUP_STALE_AFTER_MINUTES: "1e308",
+      },
+      defaultTimeoutSeconds: DEFAULT_TIMEOUT_SECONDS,
+      onLoweredToCap: (name, requested, effective) => lowered.push([name, requested, effective]),
+      onRaisedToFloor: (name) => raised.push(name),
+    });
+    expect(lowered).toEqual([
+      ["PAPERCLIP_DB_BACKUP_STALE_AFTER_MINUTES", 1e308, MAX_BACKUP_STALE_AFTER_MS / 60_000],
+    ]);
+    expect(raised).toEqual([]);
+  });
+
+  /** The cap is the largest floor, so the two clamps can never contradict. */
+  it("keeps the cap at or above every floor the deadline can produce", () => {
+    const { timeoutSeconds, staleAfterMs } = resolve({
+      PAPERCLIP_DB_BACKUP_TIMEOUT_MINUTES: "40000000",
+      PAPERCLIP_DB_BACKUP_STALE_AFTER_MINUTES: "1e308",
+    });
+    expect(timeoutSeconds).toBe(MAX_BACKUP_TIMEOUT_SECONDS);
+    expect(staleAfterMs).toBe(MAX_BACKUP_STALE_AFTER_MS);
+    expect(staleAfterMs).toBeGreaterThanOrEqual(timeoutSeconds * 1000);
+  });
+
+  it("stays quiet about the cap for an override that is honoured", () => {
+    const lowered: string[] = [];
+    resolveDatabaseBackupTimings({
+      env: {
+        PAPERCLIP_DB_BACKUP_TIMEOUT_MINUTES: "60",
+        PAPERCLIP_DB_BACKUP_STALE_AFTER_MINUTES: "600",
+      },
+      defaultTimeoutSeconds: DEFAULT_TIMEOUT_SECONDS,
+      onLoweredToCap: (name) => lowered.push(name),
+    });
+    expect(lowered).toEqual([]);
+  });
+});
+
+/**
+ * The guard is exported on its own, so it clamps independently of
+ * `resolveDatabaseBackupTimings` rather than trusting its caller.
+ */
+describe("createDatabaseBackupInFlightGuard threshold clamping", () => {
+  it("refuses to let a non-finite threshold disable takeover", () => {
+    for (const threshold of [Number.POSITIVE_INFINITY, Number.NaN]) {
+      let nowMs = 1_000;
+      const guard = createDatabaseBackupInFlightGuard({
+        staleAfterMs: threshold,
+        now: () => nowMs,
+      });
+      expect(guard.staleAfterMs).toBe(MAX_BACKUP_STALE_AFTER_MS);
+
+      expect(guard.acquire().ok).toBe(true);
+      void neverSettles();
+
+      // Inside the threshold the holder is still protected...
+      nowMs += 1000;
+      expect(guard.acquire().ok).toBe(false);
+
+      // ...and past it the lease is reclaimable.
+      nowMs += MAX_BACKUP_STALE_AFTER_MS;
+      expect(guard.acquire().ok).toBe(true);
+    }
   });
 });

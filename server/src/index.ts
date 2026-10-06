@@ -844,6 +844,15 @@ async function startServerWithDatabaseTeardown(
             `it is still inside its own deadline`,
         );
       },
+      onLoweredToCap: (name, requestedMinutes, effectiveMinutes) => {
+        logger.warn(
+          { setting: name, requestedMinutes, effectiveMinutes },
+          `Lowering ${name} from ${requestedMinutes} to ${effectiveMinutes} minutes: ` +
+            `a threshold that large can never be reached, which would leave an ` +
+            `abandoned backup holding the guard and every later scheduled run ` +
+            `refused until the server restarts`,
+        );
+      },
     });
   const databaseBackupGuard = createDatabaseBackupInFlightGuard({
     staleAfterMs: databaseBackupStaleAfterMs,
