@@ -354,7 +354,11 @@ describe("agent routes adapter validation", () => {
       const invalid = await requestApp(app, (baseUrl) => request(baseUrl).get("/api/companies/company-1/adapters/paperclip_runner/models?provider=acpx_codex"));
       expect(invalid.status).toBe(422);
     } finally { list.mockRestore(); refresh.mockRestore(); }
-  });
+    // Seven sequential round trips through the real Express stack, each paying
+    // its own server start. It runs ~48s on a slow host, so the 15s default in
+    // server/vitest.config.ts is not enough — raised the same way the other
+    // heavy server suites do it rather than by thinning the provider coverage.
+  }, 90000);
 
   it("creates agents for dynamically registered external adapter types", async () => {
     const { registerServerAdapter } = await import("../adapters/index.js");
@@ -474,6 +478,57 @@ describe("agent routes adapter validation", () => {
     );
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
+  });
+
+  it("accepts an off-catalog model when the agent brings its own Anthropic gateway", async () => {
+    // Catalog discovery reads the SERVER's ANTHROPIC_BASE_URL while execution merges
+    // the agent's adapterConfig.env, so an agent behind a gateway runs models the
+    // server cannot enumerate. Refusing them would make every gateway operator
+    // restate their model list in PAPERCLIP_ADAPTER_MODELS to keep writing configs.
+    const existing = await mockAgentService.getById();
+    mockAgentService.getById.mockResolvedValue({
+      ...existing,
+      adapterType: "claude_local",
+      adapterConfig: { model: "claude-sonnet-5" },
+    });
+    const app = await createApp();
+
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+        .send({
+          adapterConfig: {
+            model: "internal-gateway/claude-next",
+            env: { ANTHROPIC_BASE_URL: "https://llm.corp.example/anthropic" },
+          },
+        }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+  });
+
+  it("still refuses the cross-vendor model when the agent's env names no provider", async () => {
+    // The paired control for the exemption above: an ordinary env block must not
+    // read as a gateway, or naming any env at all would disable the guard.
+    const existing = await mockAgentService.getById();
+    mockAgentService.getById.mockResolvedValue({
+      ...existing,
+      adapterType: "claude_local",
+      adapterConfig: { model: "claude-sonnet-5" },
+    });
+    const app = await createApp();
+
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+        .send({
+          adapterConfig: { model: "gpt-5.6-sol-900k", env: { TZ: "UTC" } },
+        }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.code).toBe("adapter_cannot_serve_model");
+    expect(mockAgentService.update).not.toHaveBeenCalled();
   });
 
   it("refuses a create that names a model the chosen adapter cannot serve", async () => {

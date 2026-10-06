@@ -1131,6 +1131,19 @@ export function getPausedOverrides(): Set<string> {
   return pausedOverrides;
 }
 
+/**
+ * True when an EXTERNAL adapter is currently serving a builtin type — a builtin
+ * fallback is held for it and the override is not paused.
+ *
+ * Callers that established a builtin's behaviour by reading its source use this to
+ * stop applying that conclusion once the implementation has been swapped out from
+ * under the type string. A paused override is NOT overridden: `findActiveServerAdapter`
+ * returns the builtin again, so the behaviour that was verified is back in place.
+ */
+export function isBuiltinTypeOverridden(type: string): boolean {
+  return builtinFallbacks.has(type) && !pausedOverrides.has(type);
+}
+
 export function findServerAdapter(type: string): ServerAdapterModule | null {
   return adaptersByType.get(type) ?? null;
 }

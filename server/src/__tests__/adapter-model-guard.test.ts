@@ -271,6 +271,223 @@ describe("evaluateAdapterModel", () => {
   });
 });
 
+describe("evaluateAdapterModel — when the catalog is not authoritative for the agent", () => {
+  it("accepts a gateway model when the agent supplies its own Anthropic base URL", async () => {
+    // Discovery reads the SERVER's ANTHROPIC_BASE_URL; execution merges the AGENT's
+    // adapterConfig.env. A gateway model is therefore runnable while absent from the
+    // catalog, and rejecting it would force the operator to restate every gateway
+    // model in PAPERCLIP_ADAPTER_MODELS just to keep this agent's config writable.
+    const loadCatalog = claudeAndCodex();
+    const verdict = await evaluateAdapterModel(
+      {
+        adapterType: "claude_local",
+        requestedModel: "internal-gateway/claude-next",
+        adapterConfig: {
+          model: "internal-gateway/claude-next",
+          env: { ANTHROPIC_BASE_URL: "https://llm.corp.example/anthropic" },
+        },
+        previous: { adapterType: "claude_local", model: "claude-opus-5" },
+      },
+      loadCatalog,
+    );
+
+    expect(verdict).toEqual({ ok: true, reason: "agent_scoped_provider" });
+    // Decided before the fetch — no point paying for a list that bounds nothing.
+    expect(loadCatalog).not.toHaveBeenCalled();
+  });
+
+  it("accepts an agent-scoped credential, token, or Vertex project as the same signal", async () => {
+    for (const env of [
+      { ANTHROPIC_API_KEY: "sk-ant-agent-scoped" },
+      { ANTHROPIC_AUTH_TOKEN: "gateway-issued-token" },
+      { ANTHROPIC_VERTEX_PROJECT_ID: "corp-vertex-prod" },
+    ]) {
+      expect(
+        await evaluateAdapterModel(
+          {
+            adapterType: "claude_local",
+            requestedModel: "some-provider-specific-model",
+            adapterConfig: { env },
+          },
+          claudeAndCodex(),
+        ),
+      ).toEqual({ ok: true, reason: "agent_scoped_provider" });
+    }
+  });
+
+  it("treats an enabled Bedrock switch as a redirect but an explicit '0' as not one", async () => {
+    // The flag is read with the adapter's own truthiness rule. An agent that set
+    // CLAUDE_CODE_USE_BEDROCK=0 is on the default provider and still gets checked —
+    // otherwise naming a disabled flag would buy a blanket exemption.
+    expect(
+      await evaluateAdapterModel(
+        {
+          adapterType: "claude_local",
+          requestedModel: "gpt-5.6-sol-900k",
+          adapterConfig: { env: { CLAUDE_CODE_USE_BEDROCK: "1" } },
+        },
+        claudeAndCodex(),
+      ),
+    ).toEqual({ ok: true, reason: "agent_scoped_provider" });
+
+    const refused = await evaluateAdapterModel(
+      {
+        adapterType: "claude_local",
+        requestedModel: "gpt-5.6-sol-900k",
+        adapterConfig: { env: { CLAUDE_CODE_USE_BEDROCK: "0" } },
+      },
+      claudeAndCodex(),
+    );
+    expect(refused.ok).toBe(false);
+  });
+
+  it("keeps checking when adapterConfig.env holds nothing provider-scoped", async () => {
+    // An env block is ordinary. Only a provider endpoint or credential in it means
+    // the server's catalog has stopped describing what this agent can run.
+    const verdict = await evaluateAdapterModel(
+      {
+        adapterType: "claude_local",
+        requestedModel: "gpt-5.6-sol-900k",
+        adapterConfig: { env: { TZ: "UTC", CLAUDE_CONFIG_DIR: "/home/agent/.claude" } },
+      },
+      claudeAndCodex(),
+    );
+
+    expect(verdict.ok).toBe(false);
+  });
+
+  it("ignores an env that is blank, non-string, or not an object at all", async () => {
+    for (const adapterConfig of [
+      { env: { ANTHROPIC_BASE_URL: "   " } },
+      { env: { ANTHROPIC_BASE_URL: 1234 } },
+      { env: "ANTHROPIC_BASE_URL=https://llm.corp.example" },
+      { env: ["ANTHROPIC_BASE_URL"] },
+      { env: null },
+    ]) {
+      const verdict = await evaluateAdapterModel(
+        { adapterType: "claude_local", requestedModel: "gpt-5.6-sol-900k", adapterConfig },
+        claudeAndCodex(),
+      );
+      expect(verdict.ok, JSON.stringify(adapterConfig)).toBe(false);
+    }
+  });
+
+  it("scopes the redirect vars per adapter — an OpenAI base URL does not excuse claude_local", async () => {
+    expect(
+      await evaluateAdapterModel(
+        {
+          adapterType: "codex_local",
+          requestedModel: "corp-gpt-next",
+          adapterConfig: { env: { OPENAI_BASE_URL: "https://llm.corp.example/v1" } },
+        },
+        claudeAndCodex(),
+      ),
+    ).toEqual({ ok: true, reason: "agent_scoped_provider" });
+
+    const refused = await evaluateAdapterModel(
+      {
+        adapterType: "claude_local",
+        requestedModel: "gpt-5.6-sol-900k",
+        adapterConfig: { env: { OPENAI_BASE_URL: "https://llm.corp.example/v1" } },
+      },
+      claudeAndCodex(),
+    );
+    expect(refused.ok).toBe(false);
+  });
+
+  it("stops enforcing a type an external adapter has taken over", async () => {
+    // The allowlist rests on having read the BUILTIN loaders. An override keeps the
+    // type string and replaces the implementation, and `models` is optional for
+    // adapter authors, so that verification no longer describes what is installed.
+    const loadCatalog = claudeAndCodex();
+    const verdict = await evaluateAdapterModel(
+      {
+        adapterType: "claude_local",
+        requestedModel: "vendor-fork-model",
+        adapterConfig: {},
+      },
+      loadCatalog,
+      { isAdapterOverridden: (type) => type === "claude_local" },
+    );
+
+    expect(verdict).toEqual({ ok: true, reason: "adapter_overridden" });
+    expect(loadCatalog).not.toHaveBeenCalled();
+  });
+
+  it("still enforces a type whose override is not the one installed", async () => {
+    const verdict = await evaluateAdapterModel(
+      {
+        adapterType: "claude_local",
+        requestedModel: "gpt-5.6-sol-900k",
+        adapterConfig: {},
+      },
+      claudeAndCodex(),
+      { isAdapterOverridden: (type) => type === "codex_local" },
+    );
+
+    expect(verdict.ok).toBe(false);
+  });
+
+  it("checks the override against the DELEGATED catalog type, not the written type", async () => {
+    // A paperclip_runner inherits claude_local's enforcement, so it must inherit
+    // claude_local's override state too.
+    const verdict = await evaluateAdapterModel(
+      {
+        adapterType: "paperclip_runner",
+        requestedModel: "vendor-fork-model",
+        adapterConfig: { provider: "acpx" },
+      },
+      claudeAndCodex(),
+      { isAdapterOverridden: (type) => type === "claude_local" },
+    );
+
+    expect(verdict).toEqual({ ok: true, reason: "adapter_overridden" });
+  });
+
+  it("fails open when the catalog read itself throws", async () => {
+    // A discovery outage must not make every agent unwritable: that is the same
+    // lock-out this guard exists to prevent, only wider.
+    const verdict = await evaluateAdapterModel(
+      {
+        adapterType: "claude_local",
+        requestedModel: "gpt-5.6-sol-900k",
+        adapterConfig: {},
+      },
+      vi.fn(async () => {
+        throw new Error("ECONNREFUSED discovering models");
+      }),
+    );
+
+    expect(verdict).toEqual({ ok: true, reason: "catalog_unavailable" });
+  });
+
+  it("propagates a defect outside the catalog read instead of waving the write through", async () => {
+    // Fail-open answers exactly one question — "could the catalog be read?" — so
+    // only the read may answer it. A broader catch would turn any future bug in
+    // this guard into a silent bypass of the very check it exists to perform.
+    // A throw is the loud, recoverable failure; a pass is the unrecoverable one.
+    const loader = claudeAndCodex();
+
+    await expect(
+      evaluateAdapterModel(
+        {
+          adapterType: "claude_local",
+          requestedModel: "gpt-5.6-sol-900k",
+          adapterConfig: {},
+        },
+        loader,
+        {
+          isAdapterOverridden: () => {
+            throw new Error("registry defect");
+          },
+        },
+      ),
+    ).rejects.toThrow("registry defect");
+
+    expect(loader).not.toHaveBeenCalled();
+  });
+});
+
 describe("resolveModelCatalogAdapterType", () => {
   it("maps each runner provider onto the adapter that serves its models", () => {
     expect(resolveModelCatalogAdapterType("paperclip_runner", "acpx")).toBe("claude_local");

@@ -122,6 +122,7 @@ import {
   detectAdapterModel,
   findActiveServerAdapter,
   findServerAdapter,
+  isBuiltinTypeOverridden,
   listServerAdapters,
   listAdapterModels,
   refreshAdapterModels,
@@ -2661,6 +2662,17 @@ export function agentRoutes(
    * Fails OPEN on a catalog fault. A discovery outage must not make every agent
    * unwritable: that is the same lock-out, only wider. The guard rejects on a
    * positive verdict from a catalog it actually read, never on silence.
+   *
+   * That fail-open lives INSIDE `evaluateAdapterModel`, wrapped around the catalog
+   * read alone, and is deliberately not repeated here as a `try`/`catch`. A blanket
+   * catch on this call would also swallow a defect in the guard itself and skip the
+   * check — turning any future bug into a silent reopening of the hole this exists
+   * to close. An unexpected throw is therefore allowed to surface as a 500: a write
+   * that errors is recoverable, and the one this guard refuses is not.
+   *
+   * It also rejects only where the catalog is authoritative for THIS agent, so
+   * `isBuiltinTypeOverridden` is passed in: an external adapter serving a builtin
+   * type invalidates the per-adapter verification the guard's allowlist rests on.
    */
   async function assertAdapterCanServeModel(
     adapterType: string | null | undefined,
@@ -2668,24 +2680,16 @@ export function agentRoutes(
     modelGuard: AgentModelGuardContext | null,
   ): Promise<void> {
     if (!modelGuard) return;
-    let verdict;
-    try {
-      verdict = await evaluateAdapterModel(
-        {
-          adapterType,
-          adapterConfig,
-          requestedModel: modelGuard.requestedModel,
-          previous: modelGuard.previous ?? null,
-        },
-        listAdapterModels,
-      );
-    } catch (err) {
-      logger.warn(
-        { adapterType, err },
-        "Adapter model catalog unavailable; skipping model validation",
-      );
-      return;
-    }
+    const verdict = await evaluateAdapterModel(
+      {
+        adapterType,
+        adapterConfig,
+        requestedModel: modelGuard.requestedModel,
+        previous: modelGuard.previous ?? null,
+      },
+      listAdapterModels,
+      { isAdapterOverridden: isBuiltinTypeOverridden },
+    );
     if (verdict.ok) return;
     throw unprocessable(adapterModelRejectionMessage(verdict), {
       code: ADAPTER_MODEL_REJECTION_CODE,

@@ -45,6 +45,29 @@
  *    cannot see. `claude_local` is the live case: a Bedrock model id is correct
  *    when the AGENT's `adapterConfig.env` selects Bedrock, but the catalog is built
  *    from the SERVER's env, so the server cannot tell a Bedrock agent from a typo.
+ *
+ * When the catalog is not authoritative FOR THIS AGENT
+ * ---------------------------------------------------
+ * Both exemptions above answer the same question — is the server's catalog a bound
+ * on what this agent can run? Two cases answer no outright, and both skip
+ * enforcement rather than guess:
+ *
+ *  - The agent re-points its adapter at another provider through its OWN
+ *    `adapterConfig.env` (`providerCredentialEnvVars` / `providerSwitchEnvFlags`).
+ *    Discovery reads the SERVER's key and base URL (`loadClaudeModels` →
+ *    `process.env.ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL`; `loadCodexModels` →
+ *    `process.env.OPENAI_API_KEY`), while execution merges the agent's `config.env`
+ *    into the spawned process. An agent behind an Anthropic-compatible gateway can
+ *    therefore run models the server has never heard of, and enforcing the server's
+ *    list would 422 a configuration that works — forcing every gateway operator to
+ *    restate their models in `PAPERCLIP_ADAPTER_MODELS` to keep writing configs.
+ *    This generalizes the Bedrock case: Bedrock is simply the redirect this file
+ *    could already name a predicate for.
+ *  - An EXTERNAL adapter has overridden the builtin for that type. The entries below
+ *    were verified by reading the builtin loaders; an override replaces the
+ *    implementation while keeping the type string, and `models` is optional for
+ *    adapter authors, so the verification no longer holds. Enforcement follows the
+ *    implementation that was checked, not the name it registered under.
  */
 
 import { isBedrockModelId } from "@paperclipai/adapter-claude-local/server";
@@ -68,7 +91,22 @@ interface EnumeratedModelSpace {
    * validity depends on per-agent state the catalog cannot observe.
    */
   alsoAccept?: (model: string) => boolean;
+  /**
+   * `adapterConfig.env` names that supply a provider endpoint or credential of the
+   * agent's own. Any non-empty value means the agent is not served by the endpoint
+   * discovery read, so the catalog bounds nothing for it.
+   */
+  providerCredentialEnvVars?: readonly string[];
+  /**
+   * `adapterConfig.env` names that switch the adapter to another backend when
+   * ENABLED. Checked with the adapter's own truthiness rule rather than presence,
+   * so an explicit `"0"` / `"false"` still gets the catalog check.
+   */
+  providerSwitchEnvFlags?: readonly string[];
 }
+
+/** `isBedrockEnv()` in the claude-local model loader accepts exactly these. */
+const ENABLED_ENV_FLAG_VALUES = new Set(["1", "true"]);
 
 /**
  * Adapters whose catalog is authoritative: it enumerates every model the harness
@@ -91,8 +129,27 @@ interface EnumeratedModelSpace {
  *    through `resolveModelCatalogAdapterType`.
  */
 const ENUMERATED_MODEL_SPACES = new Map<string, EnumeratedModelSpace>([
-  ["claude_local", { alsoAccept: isBedrockModelId }],
-  ["codex_local", {}],
+  [
+    "claude_local",
+    {
+      alsoAccept: isBedrockModelId,
+      providerCredentialEnvVars: [
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_BEDROCK_BASE_URL",
+        "ANTHROPIC_VERTEX_BASE_URL",
+        "ANTHROPIC_VERTEX_PROJECT_ID",
+      ],
+      providerSwitchEnvFlags: ["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"],
+    },
+  ],
+  [
+    "codex_local",
+    {
+      providerCredentialEnvVars: ["OPENAI_API_KEY", "OPENAI_BASE_URL"],
+    },
+  ],
 ]);
 
 /**
@@ -122,6 +179,9 @@ export type AdapterModelVerdict =
         | "not_requested"
         | "unchanged"
         | "adapter_not_enumerated"
+        | "adapter_overridden"
+        | "agent_scoped_provider"
+        | "catalog_unavailable"
         | "open_catalog"
         | "also_accepted"
         | "in_catalog";
@@ -143,8 +203,9 @@ export interface AdapterModelGuardInput {
    */
   requestedModel: unknown;
   /**
-   * The effective adapter config the write would persist. Read only for the
-   * `provider` that selects which catalog a `paperclip_runner` delegates to.
+   * The effective adapter config the write would persist. Read for the `provider`
+   * that selects which catalog a `paperclip_runner` delegates to, and for the `env`
+   * that can point the adapter at a provider the server's catalog does not describe.
    */
   adapterConfig: Record<string, unknown>;
   /** What the agent already has. Absent on create/hire. */
@@ -154,6 +215,16 @@ export interface AdapterModelGuardInput {
   } | null;
 }
 
+export interface AdapterModelGuardOptions {
+  /**
+   * True when an external adapter currently serves this built-in type. Injected
+   * because the guard must not import the registry — `isBuiltinTypeOverridden` in
+   * production. Absent means "no override", which is the only safe default for a
+   * caller that cannot tell: it keeps today's enforcement on a stock install.
+   */
+  isAdapterOverridden?: (adapterType: string) => boolean;
+}
+
 function normalizeModel(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
@@ -161,15 +232,49 @@ function normalizeModel(value: unknown): string | null {
 }
 
 /**
+ * The `adapterConfig.env` name through which this agent supplies its own provider,
+ * or `null` when it supplies none.
+ *
+ * Values arrive from a JSON body, so a non-string is possible; only a non-empty
+ * string counts. A flag is read with the adapter's own truthiness rule so that
+ * `CLAUDE_CODE_USE_BEDROCK: "0"` — an explicit "stay on the default provider" —
+ * does not buy an exemption.
+ */
+function findAgentScopedProviderEnvVar(
+  adapterConfig: Record<string, unknown>,
+  space: EnumeratedModelSpace,
+): string | null {
+  const env = adapterConfig.env;
+  if (typeof env !== "object" || env === null || Array.isArray(env)) return null;
+  const entries = env as Record<string, unknown>;
+
+  for (const name of space.providerCredentialEnvVars ?? []) {
+    if (normalizeModel(entries[name])) return name;
+  }
+  for (const name of space.providerSwitchEnvFlags ?? []) {
+    const value = normalizeModel(entries[name]);
+    if (value && ENABLED_ENV_FLAG_VALUES.has(value.toLowerCase())) return name;
+  }
+  return null;
+}
+
+/**
  * Decide whether `adapterType` can serve the requested model.
  *
  * The catalog loader is injected so this stays testable without the adapter
- * registry. A loader that throws is the caller's to handle — see
- * `assertAdapterCanServeModel`, which fails OPEN on a loader fault on purpose.
+ * registry.
+ *
+ * A loader that throws is caught HERE, and only here, as
+ * `catalog_unavailable`. Fail-open is a deliberate answer to one question —
+ * "could the catalog be read?" — so only the read is allowed to answer it. An
+ * exception from anywhere else in this function is a defect in the guard, not a
+ * discovery outage, and it propagates: a bug must not read as a pass, because
+ * the write it would wave through is the unrecoverable one.
  */
 export async function evaluateAdapterModel(
   input: AdapterModelGuardInput,
   loadCatalog: AdapterModelCatalogLoader,
+  options: AdapterModelGuardOptions = {},
 ): Promise<AdapterModelVerdict> {
   const adapterType = typeof input.adapterType === "string" ? input.adapterType.trim() : "";
   if (!adapterType) return { ok: true, reason: "not_requested" };
@@ -195,7 +300,25 @@ export async function evaluateAdapterModel(
   const space = ENUMERATED_MODEL_SPACES.get(catalogAdapterType);
   if (!space) return { ok: true, reason: "adapter_not_enumerated" };
 
-  const catalog = await loadCatalog(catalogAdapterType);
+  // The verified loader is the builtin's. An override keeps the type string but
+  // replaces the implementation, and `models` is optional for adapter authors.
+  if (options.isAdapterOverridden?.(catalogAdapterType)) {
+    return { ok: true, reason: "adapter_overridden" };
+  }
+
+  // Discovery reads the SERVER's provider env; execution merges the AGENT's. When
+  // the agent brings its own endpoint or credential, the catalog bounds nothing.
+  if (findAgentScopedProviderEnvVar(input.adapterConfig, space)) {
+    return { ok: true, reason: "agent_scoped_provider" };
+  }
+
+  let catalog: AdapterModel[];
+  try {
+    catalog = await loadCatalog(catalogAdapterType);
+  } catch {
+    // Could not read the catalog. There is no verdict to give, so give none.
+    return { ok: true, reason: "catalog_unavailable" };
+  }
   if (catalog.length === 0) return { ok: true, reason: "open_catalog" };
 
   if (catalog.some((entry) => entry.id.trim() === model)) {
