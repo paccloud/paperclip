@@ -181,7 +181,6 @@ export type AdapterModelVerdict =
         | "adapter_not_enumerated"
         | "adapter_overridden"
         | "agent_scoped_provider"
-        | "catalog_unavailable"
         | "open_catalog"
         | "also_accepted"
         | "in_catalog";
@@ -264,12 +263,20 @@ function findAgentScopedProviderEnvVar(
  * The catalog loader is injected so this stays testable without the adapter
  * registry.
  *
- * A loader that throws is caught HERE, and only here, as
- * `catalog_unavailable`. Fail-open is a deliberate answer to one question —
- * "could the catalog be read?" — so only the read is allowed to answer it. An
- * exception from anywhere else in this function is a defect in the guard, not a
- * discovery outage, and it propagates: a bug must not read as a pass, because
- * the write it would wave through is the unrecoverable one.
+ * Nothing here is wrapped in a try/catch, and that is the fail-open design rather
+ * than a gap in it. A discovery outage does not reach this function as an
+ * exception: both enumerated loaders absorb it and degrade to a static fallback —
+ * `fetchAnthropicModels` catches its own fetch error and returns `[]`, and
+ * `loadClaudeModels` then returns `DIRECT_MODELS`. An outage therefore arrives as
+ * a short or empty catalog and is answered by `open_catalog` below, which is the
+ * fail-open path.
+ *
+ * What is left, if `loadCatalog` throws anyway, is a deterministic fault — an
+ * unreadable config while resolving a key, a malformed `PAPERCLIP_ADAPTER_MODELS`,
+ * a defect in this guard. Approving the write on those would silently skip the
+ * check for as long as the fault lasts, which is the hole this file exists to
+ * close. So the exception propagates: the write fails loudly and is recoverable,
+ * while the write this guard refuses is not.
  */
 export async function evaluateAdapterModel(
   input: AdapterModelGuardInput,
@@ -312,13 +319,8 @@ export async function evaluateAdapterModel(
     return { ok: true, reason: "agent_scoped_provider" };
   }
 
-  let catalog: AdapterModel[];
-  try {
-    catalog = await loadCatalog(catalogAdapterType);
-  } catch {
-    // Could not read the catalog. There is no verdict to give, so give none.
-    return { ok: true, reason: "catalog_unavailable" };
-  }
+  // Not wrapped in a try/catch on purpose — see the note above `loadCatalog`.
+  const catalog = await loadCatalog(catalogAdapterType);
   if (catalog.length === 0) return { ok: true, reason: "open_catalog" };
 
   if (catalog.some((entry) => entry.id.trim() === model)) {

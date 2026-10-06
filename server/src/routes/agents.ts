@@ -2663,12 +2663,13 @@ export function agentRoutes(
    * unwritable: that is the same lock-out, only wider. The guard rejects on a
    * positive verdict from a catalog it actually read, never on silence.
    *
-   * That fail-open lives INSIDE `evaluateAdapterModel`, wrapped around the catalog
-   * read alone, and is deliberately not repeated here as a `try`/`catch`. A blanket
-   * catch on this call would also swallow a defect in the guard itself and skip the
-   * check — turning any future bug into a silent reopening of the hole this exists
-   * to close. An unexpected throw is therefore allowed to surface as a 500: a write
-   * that errors is recoverable, and the one this guard refuses is not.
+   * That fail-open is reached WITHOUT a `try`/`catch`, here or in the guard: an
+   * outage degrades to an empty or static catalog inside the adapter loaders, which
+   * the guard answers by passing the write. A catch on this call would instead
+   * swallow the deterministic faults — a bad config, a defect in the guard — and
+   * skip the check silently, turning any future bug into a reopening of the hole
+   * this exists to close. An unexpected throw is therefore allowed to surface as a
+   * 500: a write that errors is recoverable, and the one this guard refuses is not.
    *
    * It also rejects only where the catalog is authoritative for THIS agent, so
    * `isBuiltinTypeOverridden` is passed in: an external adapter serving a builtin

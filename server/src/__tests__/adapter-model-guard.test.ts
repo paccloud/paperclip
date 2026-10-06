@@ -444,28 +444,45 @@ describe("evaluateAdapterModel — when the catalog is not authoritative for the
     expect(verdict).toEqual({ ok: true, reason: "adapter_overridden" });
   });
 
-  it("fails open when the catalog read itself throws", async () => {
-    // A discovery outage must not make every agent unwritable: that is the same
-    // lock-out this guard exists to prevent, only wider.
+  it("fails open on the shape a real discovery outage takes: an empty catalog", async () => {
+    // A discovery outage must not make every agent unwritable — that is the same
+    // lock-out this guard exists to prevent, only wider. It reaches the guard as
+    // an empty or static catalog, because the adapter loaders absorb the fetch
+    // error themselves, so THIS is the fail-open path.
     const verdict = await evaluateAdapterModel(
       {
         adapterType: "claude_local",
         requestedModel: "gpt-5.6-sol-900k",
         adapterConfig: {},
       },
-      vi.fn(async () => {
-        throw new Error("ECONNREFUSED discovering models");
-      }),
+      catalogFor({}),
     );
 
-    expect(verdict).toEqual({ ok: true, reason: "catalog_unavailable" });
+    expect(verdict).toEqual({ ok: true, reason: "open_catalog" });
   });
 
-  it("propagates a defect outside the catalog read instead of waving the write through", async () => {
-    // Fail-open answers exactly one question — "could the catalog be read?" — so
-    // only the read may answer it. A broader catch would turn any future bug in
-    // this guard into a silent bypass of the very check it exists to perform.
-    // A throw is the loud, recoverable failure; a pass is the unrecoverable one.
+  it("propagates a throwing catalog read instead of waving the write through", async () => {
+    // A loader that throws is NOT a discovery outage: the loaders return a static
+    // fallback for that. It is a deterministic fault — an unreadable config, a bad
+    // PAPERCLIP_ADAPTER_MODELS, a defect in this guard — and passing the write on
+    // those would skip the check silently for as long as the fault lasts, which is
+    // exactly the hole this file closes. A throw is loud and recoverable; the write
+    // it would otherwise admit is not.
+    await expect(
+      evaluateAdapterModel(
+        {
+          adapterType: "claude_local",
+          requestedModel: "gpt-5.6-sol-900k",
+          adapterConfig: {},
+        },
+        vi.fn(async () => {
+          throw new Error("unreadable adapter config");
+        }),
+      ),
+    ).rejects.toThrow("unreadable adapter config");
+  });
+
+  it("propagates a defect before the catalog read instead of waving the write through", async () => {
     const loader = claudeAndCodex();
 
     await expect(
