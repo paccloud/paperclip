@@ -1,3 +1,4 @@
+import { stageDashboardBrandAssets } from "./report-assets.js";
 import { discoverReportCatalog } from "./report-catalog.js";
 import path from "node:path";
 import {
@@ -8,7 +9,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { runnerMatrix } from "./catalog.js";
-import { summarizeExecutionBilling } from "./billing.js";
+import { billingCoverageLabel, summarizeExecutionBilling } from "./billing.js";
 import { renderRunnerE2EDashboard } from "./dashboard.js";
 import {
   buildRunnerCampaign,
@@ -147,20 +148,6 @@ async function stageDashboardEvidence(
   return staged;
 }
 
-async function stageDashboardBrandAssets(output: string) {
-  const assets = path.join(output, "assets");
-  await mkdir(assets, { recursive: true });
-  await Promise.all([
-    copyFile(
-      path.join(repositoryRoot, "ui/public/favicon-32x32.png"),
-      path.join(assets, "favicon-32x32.png"),
-    ),
-    copyFile(
-      path.join(repositoryRoot, "ui/public/fonts/InterVariable.woff2"),
-      path.join(assets, "InterVariable.woff2"),
-    ),
-  ]);
-}
 
 async function main() {
   const root = path.resolve(
@@ -368,9 +355,9 @@ async function main() {
           "",
         ]
       : []),
-    `Tokens: ${billing.llm.inputTokens} input / ${billing.llm.outputTokens} output / ${billing.llm.cachedInputTokens} cached`,
+    `Tokens: ${billingCoverageLabel(`${billing.llm.inputTokens} input / ${billing.llm.outputTokens} output / ${billing.llm.cachedInputTokens} cached`, billing.llm.runsWithTokenUsage, billing.llm.runCount)}`,
     "",
-    `Provider-reported LLM cost: $${billing.reportedLlmCostUsd.toFixed(6)} (${billing.llm.runsWithReportedCost}/${billing.llm.runCount} runs priced)`,
+    `Provider-reported LLM cost: ${billingCoverageLabel(`$${billing.reportedLlmCostUsd.toFixed(6)}`, billing.llm.runsWithReportedCost, billing.llm.runCount)}`,
     "",
     `Estimated Daytona list-price runtime cost: $${billing.estimatedRuntimeCostUsd.toFixed(6)}`,
     ...(billing.judge ? [`Estimated judge cost: ${billing.judge.estimatedCostUsd === null ? "unknown" : `$${billing.judge.estimatedCostUsd.toFixed(6)}`}; ${billing.judge.attempts} attempts; ${billing.judge.attemptsWithUnknownUsage} with unknown usage; $${billing.judge.reservedCostUsd.toFixed(6)} reserved`] : []),
@@ -385,7 +372,7 @@ async function main() {
       const cell = publicCampaignUrl
         ? `[${resolved.executionId}](${publicCampaignUrl}#execution-${encodeURIComponent(resolved.executionId)})`
         : resolved.executionId;
-      return `| ${cell} | ${resolved.attempt} | ${entry.valid ? "pass" : "fail"} | ${resolved.runtimeMode} | ${Math.round(resolved.durationMs / 1000)}s | ${cellBilling.llm.inputTokens}/${cellBilling.llm.outputTokens} | $${cellBilling.reportedCostUsd.toFixed(6)} (${cellBilling.llm.costStatus}) | ${runtimeCost === undefined ? cellBilling.runtime.costStatus : `$${runtimeCost.toFixed(6)} est.`} | ${detail} |`;
+      return `| ${cell} | ${resolved.attempt} | ${entry.valid ? "pass" : "fail"} | ${resolved.runtimeMode} | ${Math.round(resolved.durationMs / 1000)}s | ${billingCoverageLabel(`${cellBilling.llm.inputTokens}/${cellBilling.llm.outputTokens}`, cellBilling.llm.runsWithTokenUsage, cellBilling.llm.runCount)} | ${billingCoverageLabel(`$${cellBilling.reportedCostUsd.toFixed(6)}`, cellBilling.llm.runsWithReportedCost, cellBilling.llm.runCount)} | ${runtimeCost === undefined ? cellBilling.runtime.costStatus : `$${runtimeCost.toFixed(6)} est.`} | ${detail} |`;
     }),
     "",
   ];

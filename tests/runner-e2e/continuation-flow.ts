@@ -1,3 +1,5 @@
+import { gradeLifecycleBaseline, type LifecycleCheckpoint } from "./lifecycle-baseline.js";
+import { lifecycleLiveCase, lifecycleLiveContinuation, gradeLifecycleNarrative } from "./lifecycle-live-cases.js";
 import { prepareLegacyContinuationSkill } from "./continuation-fixtures.js";
 import { captureFirstTaskAttachments } from "./first-task-attachments.js";
 import { answerableRuntimeRunIds, isSingleClaudeQuestion } from "./runtime-question-readiness.js";
@@ -19,6 +21,7 @@ import {
 } from "./continuation-cases.js";
 import {
   gradeContinuation,
+  isContinuationPlan,
   type ContinuationCheckpoint,
 } from "./continuation-scoring.js";
 import { createTaskThroughUi } from "./user-actions.js";
@@ -45,8 +48,11 @@ export async function runContinuationFlow(input: {
   evidence(name: string, value: unknown): Promise<void>;
 }) {
   const { page, api, fixtures, execution } = input;
-  const scenario = continuationScenario(execution.task.id, input.nonce);
-  const checkpoints: ContinuationCheckpoint[] = [];
+  const lifecycleProbe = lifecycleLiveCase(execution.task.id);
+  const scenario = lifecycleProbe
+    ? lifecycleLiveContinuation(execution.task.id, input.nonce)
+    : continuationScenario(execution.task.id, input.nonce);
+  const checkpoints: LifecycleCheckpoint[] = [];
   let issue: Row | undefined;
   let runs: Row[] = [];
   let checks: ReturnType<typeof gradeContinuation> = [];
@@ -131,6 +137,12 @@ export async function runContinuationFlow(input: {
     );
     checkpoints.push({
       phase,
+      lifecycle: {
+        executionRunId: issue!.executionRunId ?? null,
+        scheduledRetry: issue!.scheduledRetry ?? null,
+        activeRecoveryAction: issue!.activeRecoveryAction ?? null,
+        monitorNextCheckAt: issue!.monitorNextCheckAt ?? null,
+      },
       issue: issue as ContinuationCheckpoint["issue"],
       children: tasks.filter(
         (t) => t.parentId === issue!.id,
@@ -178,6 +190,11 @@ export async function runContinuationFlow(input: {
       await page.getByTestId("question-text-answer-composer").last()
         .locator('[contenteditable="true"],textarea').first().fill(scenario.answer);
     }
+    // Claude may add a separate optional Other field after its choice page.
+    // Navigate every rendered page before submitting; do not invent an answer.
+    for (let index = 1; index < set.questions.length; index += 1) {
+      await page.getByRole("button", { name: "Next", exact: true }).last().click();
+    }
     await page
       .getByRole("button", {
         name: set.submitLabel ?? "Submit answers",
@@ -195,7 +212,7 @@ export async function runContinuationFlow(input: {
   function assertWaiting() {
     const c = checkpoints.at(-1)!;
     expect(
-      c.documents.filter((d) => d.key !== "plan"),
+      c.documents.filter((d) => !isContinuationPlan(d, c)),
       "no deliverable before authorization",
     ).toHaveLength(0);
     expect(c.attachments, "no attachment before authorization").toHaveLength(0);
@@ -262,6 +279,12 @@ export async function runContinuationFlow(input: {
       checkpoints,
       runtimeMode: execution.profile.expectedRuntimeMode,
     });
+    checks.push(...gradeLifecycleBaseline(checkpoints));
+    if (lifecycleProbe) checks.push(gradeLifecycleNarrative({
+      narrative: lifecycleProbe.narrative,
+      agentId: fixtures.agent.id,
+      initial: checkpoints.find(c => c.phase === "initial"),
+    }));
     if (issue) input.observe(issue, runs, checks);
     await input.evidence("continuation.json", {
       ...scenario,

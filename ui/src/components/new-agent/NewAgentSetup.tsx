@@ -1,3 +1,4 @@
+import { useConnectionModels } from "../ai-connections/useConnectionModels";
 import { AgentCharacter } from "../AgentCharacter";
 import { useAgentAppearanceDraft } from "../../hooks/useAgentAppearanceDraft";
 import { AiConnectionField, aiProviderForAdapter } from "../ai-connections/AiConnectionField";
@@ -53,6 +54,7 @@ import { Field } from "../agent-config-primitives";
 import { SecretPicker } from "../environment-variables-editor/SecretPicker";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
+import { NativeSelect, nativeSelectClassName } from "../ui/select";
 import {
   OnboardingCard,
   OnboardingHeading,
@@ -64,9 +66,9 @@ import {
   AgentProviderConnection,
   type ProviderConnection,
 } from "./AgentProviderConnection";
+import { adapterCuratesModelOrder } from "../../lib/model-utils";
 
-const controlClass =
-  "w-full rounded-md border border-border bg-background px-2.5 py-1.5 text-sm leading-5 outline-none focus-visible:ring-2 focus-visible:ring-ring";
+const controlClass = nativeSelectClassName;
 const blocking = (result: AdapterEnvironmentTestResult) =>
   result.status === "fail" ||
   result.checks.some((check) => check.code === ADAPTER_AUTH_MISSING_CHECK_CODE);
@@ -111,7 +113,9 @@ function Setup({
   const appearanceDraft = useAgentAppearanceDraft(`${companyId}:new-agent`);
   const isRunner = adapterType === "paperclip_runner";
   const brandType = isRunner
-    ? runnerProvider === "claude"
+    ? runnerProvider === "grok"
+      ? "grok_local"
+      : runnerProvider === "claude"
       ? "claude_local"
       : runnerProvider === "opencode"
         ? "opencode_local"
@@ -152,6 +156,7 @@ function Setup({
   );
   const [connection, setConnection] = useState<ProviderConnection | null>(null);
   const aiBinding = runtimeAiBinding ?? connection?.aiConnection;
+  const connectionModels = useConnectionModels(companyId, aiBinding, brandType);
   const [repository, setRepository] = useState("");
   const [branch, setBranch] = useState("");
   const [createdInSession, setCreated] = useState<Agent | null>(null);
@@ -184,6 +189,12 @@ function Setup({
     setTestState("idle");
     setError(null);
   };
+  const editConnection = () => {
+    setConnection(null);
+    setRuntimeAiBinding(undefined);
+    resetTest();
+    setScreen("connect");
+  };
   const adapters = useQuery({
     queryKey: queryKeys.adapters.all,
     queryFn: adaptersApi.list,
@@ -215,7 +226,7 @@ function Setup({
   const models = useQuery({
     queryKey: queryKeys.agents.adapterModels(companyId, brandType, null, aiBinding?.provider),
     queryFn: () => agentsApi.adapterModels(companyId, brandType, { provider: aiBinding?.provider }),
-    enabled: Boolean(brandType) && showModel,
+    enabled: Boolean(brandType) && showModel && !connectionModels,
     retry: false,
   });
   const companySecrets = useQuery({
@@ -340,8 +351,8 @@ function Setup({
       ...(isRunner
         ? {
             adapterSchemaValues: {
-              provider: runnerProvider === "claude" ? "acpx" : runnerProvider,
-              ...(runnerProvider === "claude" ? { acpxAgent: "claude" } : {}),
+              provider: (runnerProvider === "claude" || runnerProvider === "grok") ? "acpx" : runnerProvider,
+              ...((runnerProvider === "claude" || runnerProvider === "grok") ? { acpxAgent: runnerProvider } : {}),
             },
           }
         : {}),
@@ -349,8 +360,8 @@ function Setup({
     const config = getUIAdapter(adapterType).buildAdapterConfig(values);
     if (isRunner)
       Object.assign(config, {
-        provider: runnerProvider === "claude" ? "acpx" : runnerProvider,
-        ...(runnerProvider === "claude" ? { acpxAgent: "claude" } : {}),
+        provider: (runnerProvider === "claude" || runnerProvider === "grok") ? "acpx" : runnerProvider,
+        ...((runnerProvider === "claude" || runnerProvider === "grok") ? { acpxAgent: runnerProvider } : {}),
         ...(model ? { model } : {}),
       });
     if (!aiBinding && !nextConnection?.aiConnection && hasCredentialField && binding) {
@@ -679,9 +690,9 @@ function Setup({
                     type="button"
                     aria-current={step === screen ? "step" : undefined}
                     disabled={
-                      busy || Boolean(created) || index > steps.indexOf(screen)
+                      busy || Boolean(created) || step === "saved"
                     }
-                    onClick={() => setScreen(step)}
+                    onClick={() => step === "connect" && screen !== "connect" ? editConnection() : setScreen(step)}
                     className={cn(
                       "flex w-full items-center gap-3 rounded-md px-3 py-3 text-left text-sm",
                       step === screen
@@ -713,18 +724,42 @@ function Setup({
                     <div className="mb-8">
                       <OnboardingHeading
                         title="Connect a model"
-                        lede={`Connect ${name} to ${connectionAdapter === "claude_local" ? "Claude" : connectionAdapter === "grok_local" ? "Grok" : "OpenAI"}.`}
                         center
                       />
                     </div>
-                    <AgentProviderConnection
+                    {ready ? <AgentProviderConnection
                       key={environmentId ?? "local"}
                       companyId={companyId}
                       adapterType={connectionAdapter}
                       environmentId={environmentId}
                       canLogin={canLogin}
                       localEnvironment={environment?.driver === "local"}
+                      advancedConnection={{
+                        value: aiBinding,
+                        content: (
+                          <AiConnectionField
+                            companyId={companyId}
+                            agentName={name}
+                            adapterType={brandType}
+                            model={model}
+                            environmentId={environmentId ?? undefined}
+                            value={aiBinding}
+                            preferAdvanced
+                            onChange={binding => {
+                              if (binding.mode === "router") return;
+                              setConnection(null);
+                              setRuntimeAiBinding(binding);
+                              resetTest();
+                            }}
+                          />
+                        ),
+                      }}
                       onBack={() => navigate("/agents/all")}
+                      onDraftChanged={() => {
+                        setConnection(null);
+                        setRuntimeAiBinding(undefined);
+                        resetTest();
+                      }}
                       testConnection={runTest}
                       testError={
                         error ??
@@ -741,10 +776,11 @@ function Setup({
                       }
                       onConnected={(next) => {
                         setConnection(next);
+                        setRuntimeAiBinding(undefined);
                         resetTest();
                         setScreen("runtime");
                       }}
-                    />
+                    /> : <p role="status" className="text-sm text-muted-foreground">Loading connection settings…</p>}
                   </OnboardingCard>
                 ) : screen === "saved" && created ? (
                   <div className="space-y-6">
@@ -810,32 +846,24 @@ function Setup({
                     </h2>
                     <fieldset disabled={busy} className="space-y-8">
                       <section className="space-y-5">
-                        <h3 className="text-sm font-semibold">Runtime</h3>
-                        {aiProviderForAdapter(brandType) && (
-                          connection && !aiBinding ? (
-                            <div className="space-y-3">
-                              <p className="text-sm text-muted-foreground">
-                                Using the connection selected in the Connect step.
-                              </p>
-                              <Button type="button" variant="outline" onClick={() => setScreen("connect")}>
-                                Change connection
-                              </Button>
-                            </div>
-                          ) : (
-                            <AiConnectionField companyId={companyId} agentName={name} adapterType={brandType} model={model} environmentId={environmentId ?? undefined} value={aiBinding}
-                              onChange={binding => { setRuntimeAiBinding(binding); resetTest(); }} />
-                          )
+                        {!connectionAdapter && aiProviderForAdapter(brandType) && (
+                          <AiConnectionField companyId={companyId} agentName={name} adapterType={brandType} model={model} environmentId={environmentId ?? undefined} value={aiBinding}
+                            onChange={binding => { binding.mode !== "router" && setRuntimeAiBinding(binding); resetTest(); }} />
                         )}
-                        {models.error && <p role="alert" className="text-sm text-destructive">Could not load models. Retry or enter a model ID manually.</p>}
+                        {(connectionModels ? connectionModels.error : models.error) && <p role="alert" className="text-sm text-destructive">Could not load models. Retry or enter a model ID manually.</p>}
                         {((showModel && !usingKimiApi) ||
                           efforts.length > 0) && (
                           <div className="grid items-start gap-5 sm:grid-cols-2">
                             {showModel && !usingKimiApi && (
                               <ModelDropdown
-                                models={models.data ?? []}
+                                presentation="native"
+                                models={connectionModels?.models ?? models.data ?? []}
+                                loadingModels={connectionModels?.isLoading ?? models.isLoading}
+                                onRefreshModels={connectionModels?.refreshModels}
+                                refreshingModels={connectionModels?.refreshing}
                                 value={model}
                                 onChange={(value) => {
-                                  setModel(value);
+                                  setModel(connectionModels?.resolveModel(value) ?? value);
                                   if (
                                     effort &&
                                     !setupEfforts(adapterType, value).includes(
@@ -860,14 +888,14 @@ function Setup({
                                 allowDefault={!multiProvider}
                                 required={multiProvider}
                                 creatable
-                                groupByProvider={multiProvider}
+                                groupByProvider={multiProvider && !connectionModels}
+                                preserveOrder={Boolean(connectionModels) || adapterCuratesModelOrder(brandType)}
                               />
                             )}
                             {efforts.length > 0 && (
                               <Field label="Thinking effort">
-                                <select
+                                <NativeSelect
                                   aria-label="Thinking effort"
-                                  className={controlClass}
                                   value={effort}
                                   onChange={(event) => {
                                     setEffort(event.target.value);
@@ -880,20 +908,14 @@ function Setup({
                                       {value}
                                     </option>
                                   ))}
-                                </select>
+                                </NativeSelect>
                               </Field>
                             )}
                           </div>
                         )}
-                        {SETUP_LOGIN_HINTS[adapterType] && (
+                        {!aiBinding && SETUP_LOGIN_HINTS[adapterType] && (
                           <p className="text-sm text-muted-foreground">
                             {SETUP_LOGIN_HINTS[adapterType]}
-                          </p>
-                        )}
-                        {showModel && models.error && (
-                          <p className="text-xs text-muted-foreground">
-                            Couldn’t load models. You can enter a model ID
-                            manually.
                           </p>
                         )}
                         {hasCredentialField && !aiBinding && (
@@ -1106,7 +1128,7 @@ function Setup({
                             aria-label="Environment"
                             className={controlClass}
                             value={environmentOverride}
-                            disabled={forced.forced || managedOnly}
+                            disabled={forced.forced}
                             onChange={(event) => {
                               setEnvironmentOverride(event.target.value);
                               setConnection(null);
@@ -1118,7 +1140,7 @@ function Setup({
                               Default: {environmentLabel}
                             </option>
                             {(envs.data ?? [])
-                              .filter((env) => env.status === "active")
+                              .filter((env) => env.status === "active" && (!managedOnly || env.driver !== "local"))
                               .map((env) => (
                                 <option key={env.id} value={env.id}>
                                   {environmentDisplayLabel(env)}
@@ -1132,7 +1154,7 @@ function Setup({
                       state={testState}
                       result={result}
                       error={error}
-                      disabled={!ready || busy}
+                      disabled={!ready || busy || Boolean(connectionAdapter && !connection)}
                       onTest={() => void runTest()}
                     />
                     {error && testState !== "fail" && (
@@ -1146,7 +1168,7 @@ function Setup({
                           type="button"
                           variant="ghost"
                           disabled={busy}
-                          onClick={() => setScreen("connect")}
+                          onClick={editConnection}
                         >
                           <ArrowLeft className="size-4" />
                           Connection
@@ -1154,7 +1176,14 @@ function Setup({
                       ) : (
                         <span />
                       )}
-                      <Button
+                      {connectionAdapter && !connection ? <Button
+                        type="button"
+                        disabled={!ready || busy}
+                        onClick={() => setScreen("connect")}
+                      >
+                        Connect model
+                        <ArrowRight className="size-4" />
+                      </Button> : <Button
                         type="submit"
                         disabled={
                           !ready ||
@@ -1165,7 +1194,7 @@ function Setup({
                       >
                         {saving ? "Creating…" : "Finish setup"}
                         <Check className="size-4" />
-                      </Button>
+                      </Button>}
                     </div>
                   </form>
                 )}

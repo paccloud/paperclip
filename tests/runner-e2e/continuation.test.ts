@@ -82,6 +82,30 @@ describe("continuation behavioral evaluation", () => {
   it.each(CONTINUATION_CASES.filter(id => !["question-tool-documentation", "provider-question-bridge"].includes(id)))("accepts a complete %s recording", (id) =>
     expect(failures(recording(id))).toEqual([]),
   );
+  it("accepts a revision-bound descriptive plan key without counting it as final output", () => {
+    const r = recording("revision-preserves-approval");
+    for (const c of r.checkpoints) {
+      c.documents.push({ key: "welcome-note-plan", body: "After approval, write the note.", latestRevisionId: "plan-v1" });
+      c.interactions.push({ kind: "request_confirmation", payload: { target: { type: "issue_document", issueId: "parent", key: "welcome-note-plan", revisionId: "plan-v1" } } });
+    }
+    expect(failures(r)).toEqual([]);
+    r.checkpoints[0].documents.at(-1)!.latestRevisionId = "unapproved-v2";
+    expect(failures(r)).toContain("initial.no-premature-output");
+  });
+  it.each(["issueId", "key", "revisionId"] as const)("rejects a proposal confirmation with the wrong %s", (field) => {
+    const r = recording("revision-preserves-approval");
+    r.checkpoints[0].documents.push({ key: "welcome-note-plan", body: "After approval, write the note.", latestRevisionId: "plan-v1" });
+    const target = { type: "issue_document", issueId: "parent", key: "welcome-note-plan", revisionId: "plan-v1" };
+    target[field] = "wrong";
+    r.checkpoints[0].interactions.push({ kind: "request_confirmation", payload: { target } });
+    expect(failures(r)).toContain("initial.no-premature-output");
+  });
+  it("does not treat an arbitrary deliverable targeted for confirmation as a plan", () => {
+    const r = recording();
+    r.checkpoints[0].documents.push({ key: "welcome-note", body: r.marker, latestRevisionId: "v1" });
+    r.checkpoints[0].interactions.push({ kind: "request_confirmation", payload: { target: { type: "issue_document", issueId: "parent", key: "welcome-note", revisionId: "v1" } } });
+    expect(failures(r)).toContain("initial.no-premature-output");
+  });
   it("fails premature output even when the final result is correct", () => {
     const r = recording();
     r.checkpoints[0].documents.push({ key: "output", body: r.marker });

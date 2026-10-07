@@ -16,6 +16,22 @@ export interface ContinuationCheckpoint {
   interactions: unknown[];
   runs: Array<{ id: string; status: string; runtimeMode?: string }>;
 }
+/** A descriptive plan key is valid when an approval card binds that revision. */
+export function isContinuationPlan(
+  document: ContinuationCheckpoint["documents"][number],
+  checkpoint: ContinuationCheckpoint,
+): boolean {
+  if (document.key === "plan") return true;
+  if (!/(^|[-_])plan($|[-_])/i.test(document.key) || !document.latestRevisionId) return false;
+  return checkpoint.interactions.some((value) => {
+    const interaction = value as { kind?: string; payload?: { target?: { type?: string; issueId?: string; key?: string; revisionId?: string } } };
+    const target = interaction.payload?.target;
+    return interaction.kind === "request_confirmation" && target?.type === "issue_document"
+      && target.issueId === checkpoint.issue.id && target.key === document.key
+      && target.revisionId === document.latestRevisionId;
+  });
+}
+
 export function gradeContinuation(input: {
   id: ContinuationCase;
   fact: string;
@@ -39,7 +55,7 @@ export function gradeContinuation(input: {
   for (const c of before) {
     check(
       `${c.phase}.no-premature-output`,
-      c.documents.every((d) => d.key === "plan") &&
+      c.documents.every((d) => isContinuationPlan(d, c)) &&
         c.attachments.length === 0 &&
         c.issue.status !== "done",
       `${c.phase}: only a plan may exist before the required answer/approval; documents=${c.documents.map((d) => d.key)}, attachments=${c.attachments.length}, status=${c.issue.status}`,
@@ -59,7 +75,7 @@ export function gradeContinuation(input: {
   const verifiedAttachments = (final?.attachments as Array<Record<string, any>> ?? []).filter(a =>
     a.contentVerified === true && typeof a.body === "string" &&
     createHash("sha256").update(a.body).digest("hex") === a.contentSha256);
-  const outputs = [...(final?.documents.filter((d) => d.key !== "plan") ?? []),
+  const outputs = [...(final?.documents.filter((d) => !isContinuationPlan(d, final)) ?? []),
     ...verifiedAttachments.map(a => ({ body: a.body as string, latestRevisionId: a.sha256 as string }))];
   const output = outputs.length === 1 ? outputs[0] : undefined;
   check(

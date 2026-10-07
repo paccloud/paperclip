@@ -1,3 +1,4 @@
+import { hasPendingNativeChildCompletion, type NativeChildCompletionRecipient } from "./native-child-completion-delivery.js";
 import { and, asc, desc, eq, inArray, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import type { CreateIssueThreadInteraction } from "@paperclipai/shared";
@@ -24,6 +25,7 @@ import {
   type NativeStatusEffect,
 } from "./status-arbiter.js";
 import { nativeSha256 } from "./canonical.js";
+import { getNativeReviewAssignment, type NativeReviewAssignmentContext } from "./native-review-participant.js";
 import {
   readNativeBoardResponseWaitSource,
   readNativeBoardResponseWaitOrigin,
@@ -48,6 +50,8 @@ import {
   type ActivityPublication,
 } from "../activity-log.js";
 import { emitAgentTaskRun } from "../agent-task-run-telemetry.js";
+import { materializeNativeProviderCapacityRetry } from "./native-provider-capacity-retry.js";
+import { NATIVE_PROVIDER_OVERLOADED_CODE } from "./native-provider-failure.js";
 
 export class NativeStatusRaceError extends Error {
   readonly code = "native_status_race" as const;
@@ -787,6 +791,14 @@ async function materializeDecisionEffect(input: {
   }
   if (effect.kind === "schedule_retry") {
     failAt("continuation_materialization", input.failpoint);
+    if (effect.cause === NATIVE_PROVIDER_OVERLOADED_CODE) {
+      const retryId = await materializeNativeProviderCapacityRetry({
+        tx: input.tx as unknown as Db, companyId: input.companyId,
+        issueId: input.issue.id, runId: input.runId, agentId: effect.agentId,
+      });
+      return { effectKind: effect.kind, targetType: "heartbeat_run", targetId: retryId,
+        payload: { cause: effect.cause, summary: effect.summary } };
+    }
     const wakeId = await enqueueWake({
       tx: input.tx,
       companyId: input.companyId,
@@ -1535,6 +1547,9 @@ export async function commitNativeStatusDecision(input: {
   preMaterializedEffects?: NativeMaterializedStatusEffect[];
   supersedesCommittedDecisionId?: string;
   requireExternalChatResponseWaitAuthorization?: { agentId: string };
+  requireNoPendingChildCompletion?: NativeChildCompletionRecipient;
+  requireModelRejectionOwner?: { agentId: string; reviewContext: NativeReviewAssignmentContext | null };
+  requireProviderFailureOwner?: { agentId: string; reviewContext: NativeReviewAssignmentContext | null };
   requireBoardResponseWaitSource?: NativeBoardResponseWaitSource;
   requireBoardResponseWaitOrigin?: NativeBoardResponseWaitOrigin;
   reviewResponsePresentation?: {
@@ -1547,6 +1562,12 @@ export async function commitNativeStatusDecision(input: {
     throw new Error("native_status_reason_code_required");
   }
   const reasonCode = input.decision.reasonCode;
+  if (reasonCode === "native_provider_model_rejected" && !input.requireModelRejectionOwner) {
+    throw new Error("native_model_rejection_owner_required");
+  }
+  if (reasonCode.startsWith("native_provider_overloaded") && !input.requireProviderFailureOwner) {
+    throw new Error("native_provider_failure_owner_required");
+  }
   const publications: ActivityPublication[] = [];
   const terminalRunsToEmit: (typeof heartbeatRuns.$inferSelect)[] = [];
   const committed = await input.db.transaction(async (tx) => {
@@ -1616,6 +1637,25 @@ export async function commitNativeStatusDecision(input: {
     ) {
       throw new NativeStatusRaceError();
     }
+    // Recheck under the parent status lock: a child can finish between the
+    // finalizer's read and this commit. Re-arbitrate instead of discarding its wake.
+    if (input.requireNoPendingChildCompletion && await hasPendingNativeChildCompletion(
+      tx as unknown as Db, input.requireNoPendingChildCompletion,
+    )) throw new NativeStatusRaceError();
+    if (input.requireModelRejectionOwner || input.requireProviderFailureOwner) {
+      const owner = (input.requireProviderFailureOwner ?? input.requireModelRejectionOwner)!;
+      // A successor can claim execution without changing statusVersion. Keep
+      // this new blocking authority behind the same locked issue snapshot.
+      if (issue.executionRunId && issue.executionRunId !== input.runId) throw new NativeStatusRaceError();
+      if (owner.reviewContext) {
+        const review = await getNativeReviewAssignment(tx as unknown as Db, {
+          companyId: input.companyId, issueId: input.issueId, agentId: owner.agentId, contextSnapshot: owner.reviewContext,
+        });
+        if (review?.interaction.status !== "pending") throw new NativeStatusRaceError();
+      } else if (issue.assigneeAgentId !== owner.agentId || issue.assigneeUserId) {
+        throw new NativeStatusRaceError();
+      }
+    }
     if (input.requireExternalChatResponseWaitAuthorization) {
       let authorization;
       try {
@@ -1641,10 +1681,13 @@ export async function commitNativeStatusDecision(input: {
         throw new NativeStatusRaceError();
       }
     }
+    const passiveBoardResponseWait =
+      reasonCode === "board_response_waiting" ||
+      reasonCode === "board_response_wait_superseded";
     let boardResponseWaitOrigin: NativeBoardResponseWaitOrigin | null = null;
     if (
-      reasonCode === "board_response_waiting" ||
-      reasonCode === "board_response_wait_superseded"
+      passiveBoardResponseWait ||
+      input.requireBoardResponseWaitOrigin
     ) {
       const expected = input.requireBoardResponseWaitOrigin;
       if (
@@ -1652,7 +1695,7 @@ export async function commitNativeStatusDecision(input: {
         expected.companyId !== input.companyId ||
         expected.issueId !== input.issueId ||
         expected.runId !== input.runId ||
-        input.decision.effects.length !== 0
+        (passiveBoardResponseWait && input.decision.effects.length !== 0)
       )
         throw new NativeStatusRaceError();
       try {
@@ -1680,11 +1723,13 @@ export async function commitNativeStatusDecision(input: {
     let boardResponseWait: Awaited<
       ReturnType<typeof readNativeBoardResponseWaitSource>
     > = null;
-    if (reasonCode === "board_response_waiting") {
+    // Corrective continuations also carry this precondition. Revalidate it
+    // under the same locks before any decision effects can restart old work.
+    if (reasonCode === "board_response_waiting" || input.requireBoardResponseWaitSource) {
       const expected = input.requireBoardResponseWaitSource;
       if (
         !expected ||
-        input.decision.effects.length !== 0 ||
+        (passiveBoardResponseWait && input.decision.effects.length !== 0) ||
         expected.companyId !== input.companyId ||
         expected.issueId !== input.issueId ||
         expected.runId !== input.runId
@@ -1741,6 +1786,34 @@ export async function commitNativeStatusDecision(input: {
         throw error;
       }
     }
+    const recordCoordinatorDecision = async (decisionId: string) => {
+      const finalizationError = input.decision.effects.find(
+        effect => effect.kind === "record_finalization_error",
+      );
+      await tx
+        .update(nativeRunFinalizations)
+        .set({
+          phase: finalizationError ? "retryable_failure" : "committed",
+          assessmentId: input.assessmentId,
+          decisionId,
+          leaseOwner: null,
+          leaseExpiresAt: null,
+          failureCode: finalizationError?.cause ?? null,
+          failureDetail: finalizationError
+            ? {
+                originalFailureCode: finalizationError.cause,
+                recoveryOwner: {
+                  kind: "agent",
+                  agentId: finalizationError.agentId,
+                },
+                nextAction: finalizationError.nextAction,
+              }
+            : null,
+          nextAttemptAt: finalizationError ? new Date(Date.now() + 30_000) : null,
+          updatedAt: new Date(),
+        })
+        .where(eq(nativeRunFinalizations.runId, input.runId));
+    };
     const decisionJson = {
       statusAction: input.decision.statusAction,
       toStatus: input.decision.toStatus,
@@ -1784,6 +1857,9 @@ export async function commitNativeStatusDecision(input: {
       decisionRow?.applicationState === "applied" ||
       decisionRow?.applicationState === "proposed"
     ) {
+      // The effects already committed, but this retry owns a fresh coordinator
+      // lease. Release it and restore the retry deadline without replaying effects.
+      await recordCoordinatorDecision(decisionRow.id);
       return { decision: decisionRow, issue, replayed: true };
     }
     if (!decisionRow) {
@@ -1822,7 +1898,7 @@ export async function commitNativeStatusDecision(input: {
     }
     if (!decisionRow) throw new Error("native_status_decision_not_persisted");
 
-    if (boardResponseWait) {
+    if (boardResponseWait && reasonCode === "board_response_waiting") {
       // The answer and passive-wait receipt commit together. In particular,
       // no chat presentation authorization is supplied: this is Board-only.
       await issueService(tx as unknown as Db).addComment(
@@ -1832,6 +1908,16 @@ export async function commitNativeStatusDecision(input: {
         undefined,
         tx,
       );
+    }
+
+    if (input.decision.statusAction === "done" && issue.status !== "done" &&
+        issue.parentId && issue.originKind !== "task_watchdog") {
+      // Serialize child notification creation with the parent's final pending-
+      // result check. Lock before child writes can acquire an implicit parent
+      // foreign-key lock, so concurrent siblings never upgrade shared locks.
+      await tx.select({ id: issues.id }).from(issues).where(and(
+        eq(issues.id, issue.parentId), eq(issues.companyId, input.companyId),
+      )).for("update");
     }
 
     const materialized: NativeMaterializedStatusEffect[] = [];
@@ -1930,10 +2016,20 @@ export async function commitNativeStatusDecision(input: {
       const parentIsDependent = parent
         ? dependents.some((dependent) => dependent.id === parent.id)
         : false;
+      // Ordinary children can finish new work after reopening. Key that wake to
+      // the committed decision; replaying the decision still shares its identity.
+      // Watchdog children retain their stable key to avoid feedback loops.
+      const childCompletionDecisionId = issue.originKind === "task_watchdog" ? null : decisionRow.id;
+      const childCompletionRevision = childCompletionDecisionId ? `:${childCompletionDecisionId}` : "";
+      // The dispatcher must retain this new input until a fresh parent turn can
+      // read it. Watchdog handoffs keep their existing coalescing semantics.
+      const childCompletionDelivery = childCompletionDecisionId
+        ? { nativeChildCompletionDecisionId: childCompletionDecisionId }
+        : {};
       for (const dependent of dependents) {
         const isCompletedChildParent = parent?.id === dependent.id;
         const idempotencyKey = isCompletedChildParent
-          ? `issue_children_completed:${dependent.id}:${input.issueId}`
+          ? `issue_children_completed:${dependent.id}:${input.issueId}${childCompletionRevision}`
           : buildIssueBlockersResolvedWakeIdempotencyKey({
               dependentIssueId: dependent.id,
               resolvedBlockerIssueId: input.issueId,
@@ -1942,8 +2038,10 @@ export async function commitNativeStatusDecision(input: {
           isCompletedChildParent && parent
             ? {
                 completedChildIssueId: input.issueId,
+                ...childCompletionDelivery,
                 childIssueIds: parent.childIssueIds,
                 childIssueSummaries: parent.childIssueSummaries,
+                onboardingCompletion: parent.onboardingCompletion,
                 childIssueSummaryTruncated: parent.childIssueSummaryTruncated,
               }
             : null;
@@ -1983,17 +2081,21 @@ export async function commitNativeStatusDecision(input: {
           issueId: parent.id,
           agentId: parent.assigneeAgentId,
           reason: "issue_children_completed",
-          idempotencyKey: `issue_children_completed:${parent.id}:${input.issueId}`,
+          idempotencyKey: `issue_children_completed:${parent.id}:${input.issueId}${childCompletionRevision}`,
           payload: {
             completedChildIssueId: input.issueId,
+            ...childCompletionDelivery,
             childIssueIds: parent.childIssueIds,
             childIssueSummaries: parent.childIssueSummaries,
+            onboardingCompletion: parent.onboardingCompletion,
             childIssueSummaryTruncated: parent.childIssueSummaryTruncated,
           },
           contextSnapshot: {
             completedChildIssueId: input.issueId,
+            ...childCompletionDelivery,
             childIssueIds: parent.childIssueIds,
             childIssueSummaries: parent.childIssueSummaries,
+            onboardingCompletion: parent.onboardingCompletion,
             childIssueSummaryTruncated: parent.childIssueSummaryTruncated,
           },
         });
@@ -2004,7 +2106,9 @@ export async function commitNativeStatusDecision(input: {
           payload: {
             parentIssueId: parent.id,
             completedChildIssueId: input.issueId,
+            ...childCompletionDelivery,
             childIssueSummaries: parent.childIssueSummaries,
+            onboardingCompletion: parent.onboardingCompletion,
             childIssueSummaryTruncated: parent.childIssueSummaryTruncated,
           },
         });
@@ -2033,9 +2137,6 @@ export async function commitNativeStatusDecision(input: {
     const shadowOnly = input.decision.effects.some(
       (effect) => effect.kind === "record_shadow_decision",
     );
-    const finalizationError = input.decision.effects.find(
-      (effect) => effect.kind === "record_finalization_error",
-    );
     const applicationState = shadowOnly ? "proposed" : "applied";
     await tx
       .update(statusDecisions)
@@ -2044,29 +2145,7 @@ export async function commitNativeStatusDecision(input: {
         appliedAt: shadowOnly ? null : new Date(),
       })
       .where(eq(statusDecisions.id, decisionRow.id));
-    await tx
-      .update(nativeRunFinalizations)
-      .set({
-        phase: finalizationError ? "retryable_failure" : "committed",
-        assessmentId: input.assessmentId,
-        decisionId: decisionRow.id,
-        leaseOwner: null,
-        leaseExpiresAt: null,
-        failureCode: finalizationError?.cause ?? null,
-        failureDetail: finalizationError
-          ? {
-              originalFailureCode: finalizationError.cause,
-              recoveryOwner: {
-                kind: "agent",
-                agentId: finalizationError.agentId,
-              },
-              nextAction: finalizationError.nextAction,
-            }
-          : null,
-        nextAttemptAt: finalizationError ? new Date(Date.now() + 30_000) : null,
-        updatedAt: new Date(),
-      })
-      .where(eq(nativeRunFinalizations.runId, input.runId));
+    await recordCoordinatorDecision(decisionRow.id);
     if (externalChatReviewPresentation && input.reviewResponsePresentation) {
       await restoreNativeChatReviewPresentationInTransaction(
         tx as unknown as Db,

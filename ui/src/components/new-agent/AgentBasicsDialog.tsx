@@ -1,5 +1,6 @@
 import { useCompany } from "@/context/CompanyContext";
 import { useAgentAppearanceDraft } from "@/hooks/useAgentAppearanceDraft";
+import { AdapterMark } from "../AdapterMark";
 import { AgentCharacter } from "../AgentCharacter";
 import { useId, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
@@ -25,62 +26,8 @@ export type AgentBasics = {
   adapterType: string;
   runnerProvider: string;
 };
-const brandMarks: Record<string, { src: string; dark?: string }> = {
-  claude_local: { src: "/brands/claude-color.svg" },
-  codex_local: { src: "/brands/codex-color.svg" },
-  gemini_local: { src: "/brands/adapters/gemini-color.svg" },
-  kimi_local: {
-    src: "/brands/adapters/kimi-color-light.svg",
-    dark: "/brands/adapters/kimi-color.svg",
-  },
-  ...Object.fromEntries(
-    [
-      ["cursor", "cursor"],
-      ["cursor_cloud", "cursor"],
-      ["grok_local", "grok"],
-      ["hermes_local", "hermesagent"],
-      ["hermes_gateway", "hermesagent"],
-      ["pi_local", "pi"],
-    ].map(([type, icon]) => [
-      type,
-      {
-        src: `/brands/adapters/${icon}.svg`,
-        dark: `/brands/adapters/${icon}-dark.svg`,
-      },
-    ]),
-  ),
-};
-export function AdapterMark({
-  type,
-  className = "size-6",
-}: {
-  type: string;
-  className?: string;
-}) {
-  const Icon = getAdapterDisplay(type).icon;
-  const mark = brandMarks[type];
-  if (!mark) return <Icon className={className} />;
-  return (
-    <>
-      <img
-        src={mark.src}
-        className={cn(
-          "shrink-0 object-contain",
-          mark.dark && "dark:hidden",
-          className,
-        )}
-        alt=""
-      />
-      {mark.dark && (
-        <img
-          src={mark.dark}
-          className={cn("hidden shrink-0 object-contain dark:block", className)}
-          alt=""
-        />
-      )}
-    </>
-  );
-}
+export { AdapterMark } from "../AdapterMark";
+
 function AgentBasicsCharacter() {
   const { selectedCompanyId } = useCompany();
   const { appearance } = useAgentAppearanceDraft(`${selectedCompanyId}:new-agent`);
@@ -226,7 +173,7 @@ export function AgentBasicsDialog({
                     {error.message}
                   </p>
                 )}
-                <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+                <div className={cn("grid grid-cols-2 gap-3", choices.length !== 4 && "sm:grid-cols-3")}>
                   {choices.map((adapter) => {
                     const display = getAdapterDisplay(adapter.type);
                     return (
@@ -274,6 +221,7 @@ export function AgentBasicsDialog({
                     >
                       <option value="codex">Codex (app server)</option>
                       <option value="claude">Claude (ACPX)</option>
+                      <option value="grok">Grok Build (ACPX)</option>
                       <option value="opencode">OpenCode</option>
                     </select>
                   </label>

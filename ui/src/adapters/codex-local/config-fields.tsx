@@ -1,4 +1,5 @@
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../../components/ui/select";
+import { AdapterMark } from "../../components/AdapterMark";
 import { configFieldsForSection } from "../config-sections";
 import type { AdapterConfigFieldsProps } from "../types";
 import {
@@ -20,6 +21,7 @@ import {
   PAPERCLIP_RUNNER_IDLE_TIMEOUT_DEFAULT_MS,
   PAPERCLIP_RUNNER_IDLE_TIMEOUT_MAX_MS,
   PAPERCLIP_RUNNER_PERMISSION_CAPABILITIES,
+  PAPERCLIP_RUNNER_ACPX_PROFILES,
   isPaperclipRunnerProvider,
   resolvePaperclipRunnerIdleTimeoutMs,
   resolvePaperclipRunnerPermissionMode,
@@ -35,6 +37,14 @@ const defaultOpenCodeRunnerModel = "openrouter/deepseek/deepseek-v4-flash-0731";
 const defaultAcpxClaudeModel = "claude-sonnet-5";
 const defaultClaudeManagedModel = "claude-sonnet-5";
 const defaultAwsAgentCoreModel = "global.anthropic.claude-sonnet-4-6";
+const runnerHarnessOptions = [
+  { value: "codex", label: "Codex", adapter: "codex_local" },
+  { value: "opencode", label: "OpenCode 1.18.34", adapter: "opencode_local" },
+  { value: "claude_managed", label: "Claude Managed", adapter: "claude_local" },
+  { value: "aws_agentcore", label: "AWS AgentCore", adapter: "aws_agentcore" },
+  { value: "acpx", label: "ACP agents", adapter: "acpx_local" },
+  { value: "grok", label: "Grok Build", adapter: "grok_local" },
+];
 
 export function CodexLocalConfigFields({
   section,
@@ -190,15 +200,15 @@ export function CodexLocalConfigFields({
       )}
       {runnerManaged && (
         <Field configSection="adapter"
-          label="Provider"
-          hint="The runner persists this provider with each run so recovery cannot drift after configuration changes."
+          label="Harness"
+          hint="Choose the agent harness that runs your tasks."
         >
-          <select
-            className={inputClass}
-            value={runnerProvider}
-            onChange={(event) => {
-              const provider = isPaperclipRunnerProvider(event.target.value)
-                ? event.target.value
+          <Select
+            value={runnerProvider === "acpx" && runnerSchemaValue("acpxAgent", "claude") === "grok" ? "grok" : runnerProvider}
+            onValueChange={(value) => {
+              const grok = value === "grok";
+              const provider = grok ? "acpx" : isPaperclipRunnerProvider(value)
+                ? value
                 : "codex";
               const model =
                 provider === "opencode"
@@ -208,7 +218,7 @@ export function CodexLocalConfigFields({
                     : provider === "aws_agentcore"
                       ? defaultAwsAgentCoreModel
                       : provider === "acpx"
-                        ? defaultAcpxClaudeModel
+                        ? grok ? "grok-4.7" : defaultAcpxClaudeModel
                         : DEFAULT_CODEX_LOCAL_MODEL;
               if (isCreate) {
                 set!({
@@ -216,24 +226,51 @@ export function CodexLocalConfigFields({
                   adapterSchemaValues: {
                     ...values!.adapterSchemaValues,
                     provider,
-                    ...(provider === "acpx" ? { acpxAgent: "claude" } : {}),
+                    ...(provider === "acpx" ? { acpxAgent: grok ? "grok" : "claude" } : {}),
                   },
                 });
               } else {
                 mark("adapterConfig", "provider", provider);
                 mark("adapterConfig", "model", model);
                 if (provider === "acpx") {
-                  mark("adapterConfig", "acpxAgent", "claude");
+                  mark("adapterConfig", "acpxAgent", grok ? "grok" : "claude");
                 }
               }
             }}
           >
-            <option value="codex">Codex</option>
-            <option value="opencode">OpenCode 1.18.29</option>
-            <option value="claude_managed">Claude Managed</option>
-            <option value="aws_agentcore">AWS AgentCore</option>
-            <option value="acpx">ACPX Claude</option>
-          </select>
+            <SelectTrigger className="w-full" aria-label="Harness"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              {runnerHarnessOptions.map((option) => (
+                <SelectItem key={option.value} value={option.value}>
+                  <AdapterMark type={option.adapter} className="size-4" />
+                  {option.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </Field>
+      )}
+      {runnerManaged && runnerProvider === "acpx" && runnerSchemaValue("acpxAgent", "claude") !== "grok" && (
+        <Field configSection="adapter" label="ACP agent" hint="Cursor, GitHub Copilot, and Pi are awaiting local and Daytona qualification.">
+          <Select
+            value={String(isCreate ? values!.adapterSchemaValues?.acpxAgent ?? "claude" : eff("adapterConfig", "acpxAgent", config.acpxAgent ?? "claude"))}
+            onValueChange={(value) => {
+              const profile = PAPERCLIP_RUNNER_ACPX_PROFILES.find(entry => entry.value === value);
+              if (!profile?.qualified) return;
+              if (isCreate) set!({ model: profile.value === "claude" ? defaultAcpxClaudeModel : "",
+                adapterSchemaValues: { ...values!.adapterSchemaValues, acpxAgent: profile.value } });
+              else { mark("adapterConfig", "acpxAgent", profile.value); mark("adapterConfig", "model", profile.value === "claude" ? defaultAcpxClaudeModel : ""); }
+            }}>
+            <SelectTrigger className="w-full" aria-label="ACP agent"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              {PAPERCLIP_RUNNER_ACPX_PROFILES.map(profile => (
+                <SelectItem key={profile.value} value={profile.value} disabled={!profile.qualified}>
+                  <AdapterMark type={profile.value === "cursor" ? "cursor" : `${profile.value}_local`} className="size-4" />
+                  {profile.label}{profile.qualified ? "" : " — qualification pending"}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
         </Field>
       )}
       {runnerManaged && runnerProvider === "claude_managed" && (
