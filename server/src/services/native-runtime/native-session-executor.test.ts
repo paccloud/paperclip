@@ -29,6 +29,8 @@ import {
   type Db,
 } from "@paperclipai/db";
 import {
+  CURSOR_DISTRIBUTION_PINS,
+  QUALIFIED_ACPX_PROFILES,
   acpxRuntimeSessionDirectoryName,
   resolveAcpxRuntimeRoot,
   createPrpSemanticToolInputEnvelope,
@@ -50,6 +52,7 @@ import {
   NativeSessionProtocolIntegrityError,
 } from "../../vendor/paperclip-runner/index.js";
 import * as issueServiceModule from "../issues.js";
+import { NativePermissionDeclinedError } from "./native-permission-decline.js";
 import {
   createNativeHarnessBackupStamp,
   verifyNativeHarnessBackupStamp,
@@ -310,7 +313,9 @@ import {
   REMOTE_RUNNER_CHILD_LAUNCH_SCRIPT,
   verifyRemoteRunnerReattachment,
   readRemoteProviderPackManifest,
+  readBundledRemoteProviderPackManifest,
   providerSessionIdentityFromDurableProviderState,
+  durableProviderCheckpointFailureReason,
   providerSessionIdentityTransitionIsAllowed,
   providerPlanMarkdown,
   remoteCheckpointIncompleteFailure,
@@ -1151,6 +1156,40 @@ describe("remote provider pack manifest", () => {
     expect(readRemoteProviderPackManifest(root).payload.pins.opencode).toBe(
       "1.18.34",
     );
+    const cursorPath = "provider-assets/cursor/linux-x64";
+    await mkdir(join(root, cursorPath), { recursive: true });
+    await writeFile(join(root, cursorPath, "runtime"), "pinned Cursor runtime");
+    const cursor = { version: QUALIFIED_ACPX_PROFILES.cursor.agentServerVersion, profileDigest: QUALIFIED_ACPX_PROFILES.cursor.commandDigest,
+      closureDigest: `sha256:${CURSOR_DISTRIBUTION_PINS["linux-x64"].closureSha256}`, qualification: "qualified", path: cursorPath,
+      sha256: sha256DirectoryTree(join(root, cursorPath)) };
+    Object.assign(payload, { providers: { cursor } });
+    await writeManifest();
+    expect(readRemoteProviderPackManifest(root).payload.providers?.cursor?.version).toBe(QUALIFIED_ACPX_PROFILES.cursor.agentServerVersion);
+    const releaseMetadata = await mkdtemp(join(tmpdir(), "paperclip-image-identity-"));
+    const manifestPath = join(releaseMetadata, "provider-pack.json");
+    await cp(join(root, "provider-pack.json"), manifestPath);
+    expect(readBundledRemoteProviderPackManifest(manifestPath).digest).toBe(readRemoteProviderPackManifest(root).digest);
+    // Rehashing an internally valid old pack must not admit a different release.
+    for (const field of ["version", "profileDigest", "closureDigest"] as const) {
+      const previous = cursor[field];
+      Object.assign(cursor, { [field]: field === "version" ? "older-cursor" : digest(`old-${field}`) });
+      await writeManifest(); await cp(join(root, "provider-pack.json"), manifestPath);
+      expect(() => readRemoteProviderPackManifest(root)).toThrow("Cursor profile or closure");
+      expect(() => readBundledRemoteProviderPackManifest(manifestPath)).toThrow("Cursor profile or closure");
+      Object.assign(cursor, { [field]: previous });
+    }
+    await writeManifest(); await cp(join(root, "provider-pack.json"), manifestPath);
+    // A metadata-only release identity is never accepted as a host asset tree.
+    expect(() => readRemoteProviderPackManifest(releaseMetadata)).toThrow();
+    const originalTarget = payload.target;
+    payload.target = { platform: "darwin", architecture: "arm64" };
+    await writeManifest(); await cp(join(root, "provider-pack.json"), manifestPath);
+    expect(() => readBundledRemoteProviderPackManifest(manifestPath)).toThrow();
+    payload.target = originalTarget; await writeManifest();
+    await rm(releaseMetadata, { recursive: true, force: true });
+    await writeFile(join(root, cursorPath, "runtime"), "substitute Cursor runtime");
+    expect(() => readRemoteProviderPackManifest(root)).toThrow("asset tree digest mismatch");
+    await writeFile(join(root, cursorPath, "runtime"), "pinned Cursor runtime");
     const candidatePath = "provider-assets/pi/linux-x64";
     await mkdir(join(root, candidatePath), { recursive: true });
     await writeFile(join(root, candidatePath, "runtime"), "pinned runtime");
@@ -1719,6 +1758,37 @@ describe("split durable provider checkpoint identity", () => {
         lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null },
       },
     }) as unknown as NativeExecutionInputV1;
+
+  it.each(["agent", "plan", "ask", "architect"] as const)("requires both persisted provider mode bindings for %s recovery", mode => {
+    const profileDigest = `sha256:${"a".repeat(64)}`;
+    const input = execution({ kind: "acpx", agent: "cursor", model: "explicit-model", permissionMode: "approve-all", mode: mode }, "acpx_runtime");
+    const identity = {
+      kind: "acpx", normalizedSessionId: "native-session", acpxRecordId: "record",
+      backendSessionId: "backend", agentSessionId: "agent-session", profileDigest,
+      workspaceDigest: `sha256:${"b".repeat(64)}`, requestedModel: "explicit-model",
+      effectiveModel: "explicit-model", permissionMode: "approve-all", mode: mode,
+      providerLifetimeFenceCandidates: [53001, 53002, 53003],
+    };
+    const state = {
+      schema: "paperclip.runner.acpx-provider-state.v3", lifecycle: "suspended",
+      activeTurnId: null, providerExitUnconfirmed: false,
+      descriptor: { kind: "acpx", provider: "acpx", driver: "acpx_runtime", agent: "cursor",
+        model: "explicit-model", commandDigest: profileDigest, normalizedSessionId: "native-session", mode: mode },
+      identity,
+    };
+    expect(providerSessionIdentityFromDurableProviderState({ execution: input, providerState: state })).toMatchObject({ providerSessionIdentity: identity });
+    for (const field of ["descriptor", "identity"] as const) {
+      for (const wrong of [undefined, mode === "agent" ? "plan" : "agent"]) {
+        const changed = structuredClone(state);
+        (changed[field] as Record<string, unknown>).mode = wrong;
+        expect(providerSessionIdentityFromDurableProviderState({ execution: input, providerState: changed })).toEqual({ providerSessionId: null, providerBackendSessionId: null, providerSessionIdentity: null });
+        expect(durableProviderCheckpointFailureReason(input, changed)).toBe("mode_binding");
+      }
+    }
+    const unsettled = { ...state, providerExitUnconfirmed: true, privateProviderData: "secret-canary" };
+    expect(providerSessionIdentityFromDurableProviderState({ execution: input, providerState: unsettled }).providerSessionIdentity).toBeNull();
+    expect(durableProviderCheckpointFailureReason(input, unsettled)).toBe("provider_exit_unconfirmed");
+  });
 
   it("reads ACPX identity from its provider-owned state after suspension", () => {
     const profileDigest = `sha256:${"a".repeat(64)}`;
@@ -7383,7 +7453,25 @@ describe("native warm session supervision", () => {
 });
 
 describe("native session bounded recovery", () => {
-  it.each(["operator", "reassignment"])("does not turn an acknowledged %s Stop before completion into a failure or a retry", async (source) => {
+  it("blocks a denied Cursor task and gives recovery to the operator without another provider attempt", async () => {
+    const updates: Array<{ table: unknown; values: Record<string, unknown> }> = [];
+    const failure = new NativePermissionDeclinedError();
+    state.execute.mockReset().mockRejectedValueOnce(failure);
+    state.upsertRecoveryAction.mockReset().mockResolvedValue({});
+    const updateIssue = vi.fn(async () => ({ status: "blocked", statusVersion: 7 }));
+    const service = vi.spyOn(issueServiceModule, "issueService").mockReturnValue({ update: updateIssue } as unknown as ReturnType<typeof issueServiceModule.issueService>);
+    try {
+    await expect(executePaperclipNativeSession({ db: leaseDb(execution, {}, {}, updates), execution, runnerInstanceId: "runner" })).rejects.toBe(failure);
+    expect(updates.find(update => update.table === nativeRunFinalizations && update.values.phase === "terminal_failure")?.values).toMatchObject({
+      failureCode: "native_permission_declined", nextAttemptAt: null,
+      failureDetail: { recoverable: false, nextAction: expect.stringContaining("Automatic recovery is stopped") },
+    });
+    expect(updateIssue).toHaveBeenCalledWith(execution.binding.issueId, { status: "blocked" }, expect.anything());
+    expect(state.upsertRecoveryAction).toHaveBeenCalledWith(expect.objectContaining({ cause: "native_permission_declined", ownerType: "board", wakePolicy: null }));
+    expect(state.execute).toHaveBeenCalledTimes(1);
+    } finally { service.mockRestore(); }
+  });
+  it.each([["operator", "missing-result"], ["reassignment", "missing-result"], ["operator", "permission-declined"], ["reassignment", "permission-declined"]])("does not turn an acknowledged %s Stop before %s completion into a failure or a retry", async (source, failureKind) => {
     const updates: Array<{ table: unknown; values: Record<string, unknown> }> = [];
     const stop: Record<string, unknown> = {};
     state.execute.mockReset().mockImplementationOnce(async () => {
@@ -7393,7 +7481,7 @@ describe("native session bounded recovery", () => {
         schema: "paperclip.native-cancellation.v1", ...execution.binding, scope: "run", reasonCode: "cancellation_run_only",
         dispatched: true, dispatchState: "acknowledged", intentAuditId: "intent", acknowledgementAuditId: "ack",
       } });
-      throw new Error("native_finalization_missing: session returned no semantic result");
+      throw failureKind === "permission-declined" ? new NativePermissionDeclinedError() : new Error("native_finalization_missing: session returned no semantic result");
     });
     state.upsertRecoveryAction.mockClear();
     await expect(executePaperclipNativeSession({
@@ -8220,7 +8308,7 @@ describe("native process ownership", () => {
     },
   );
 
-  it.each(["pi", "cursor", "copilot"])("rejects ACPX candidate %s without host authorization before constructing a backend", async (agent) => {
+  it.each(["pi", "copilot"])("rejects ACPX candidate %s without host authorization before constructing a backend", async (agent) => {
     const piExecution = {
       ...execution,
       binding: { ...execution.binding, runId: "run-acpx-pi-rejected" },

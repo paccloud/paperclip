@@ -37,6 +37,8 @@ describe("native final-response feedback", () => {
     const feedback = await nativeCompletionFeedback(db, value.runId, done);
     expect(feedback).toContain(`[Saved document](${value.saved.documentHref})`);
     expect(feedback).toContain("in your final response");
+    expect(feedback).toContain("Follow the user's explicitly requested final-response format");
+    expect(feedback).toContain("When compatible with the requested response format");
     expect(feedback).not.toContain("publish secrets");
   });
   it("does not link stale saved revisions", async () => {
